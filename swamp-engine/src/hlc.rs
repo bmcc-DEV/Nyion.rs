@@ -44,7 +44,7 @@ impl WallClock {
             return 1u64 << 32; // fallback 1ns/tick
         }
         let ns = 10_000_000u64;
-        ((ns as u128) << 32 / elapsed as u128) as u64
+        (((ns as u128) << 32) / elapsed as u128) as u64
     }
 
     fn now_monotonic_ns() -> u64 {

@@ -27,7 +27,9 @@ impl PolicyEngine {
             fallback_threads,
         };
 
-        engine.reload()?;
+        if !script_path.is_empty() {
+            engine.reload()?;
+        }
         Ok(engine)
     }
 
@@ -42,6 +44,9 @@ impl PolicyEngine {
     }
 
     pub fn try_reload(&self) {
+        if self.script_path.is_empty() {
+            return;
+        }
         let path = Path::new(&self.script_path);
         if let Ok(metadata) = path.metadata() {
             if let Ok(modified) = metadata.modified() {
@@ -60,6 +65,9 @@ impl PolicyEngine {
     }
 
     fn update_last_load(&self) {
+        if self.script_path.is_empty() {
+            return;
+        }
         if let Ok(metadata) = Path::new(&self.script_path).metadata() {
             if let Ok(modified) = metadata.modified() {
                 if let Ok(d) = modified.duration_since(UNIX_EPOCH) {
@@ -101,6 +109,10 @@ impl PolicyEngine {
             }
             _ => false,
         }
+    }
+
+    pub fn script_path(&self) -> &str {
+        &self.script_path
     }
 
     pub fn suggested_batch_size(&self, context_tokens: usize, temp_celsius: f64) -> usize {

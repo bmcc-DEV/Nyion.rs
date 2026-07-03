@@ -17,14 +17,9 @@ function thermal.adapt_threads(c_epsilon, temp_celsius, freq_mhz)
     end
 end
 
-function thermal.should_skip_layer(layer_idx, temp_celsius)
-    if temp_celsius > 88 then
-        return layer_idx % 2 == 0  -- critico: skip even layers
-    elseif temp_celsius > 82 then
-        return layer_idx % 3 == 0  -- quente: skip every 3rd
-    end
-    return false
-end
+-- should_skip_layer intentionally omitted:
+-- skipping layers breaks the residual stream and causes severe quality degradation.
+-- Use adapt_threads + suggest_batch_size for thermal backoff instead.
 
 function thermal.suggest_batch_size(context_tokens, temp_celsius)
     if temp_celsius > 88 then
@@ -40,5 +35,4 @@ end
 
 -- Export global
 adapt_threads = thermal.adapt_threads
-should_skip_layer = thermal.should_skip_layer
 suggest_batch_size = thermal.suggest_batch_size

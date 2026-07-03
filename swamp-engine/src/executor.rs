@@ -6,6 +6,7 @@ use crate::model::Model;
 use crate::sampler::Sampler;
 use crate::thermal::ThermalCoordinator;
 use crate::lsc::LscPrefetcher;
+use crate::policy::PolicyEngine;
 use tokio::sync::mpsc::Sender;
 use std::sync::Arc;
 use crate::cache::PagedKVCache;
@@ -134,6 +135,7 @@ pub fn prefill_batch(
         } else {
             for t in 0..batch {
                 let seq_len = t + 1;
+                kv_cache.ensure_pages_hot(0, seq_len / kv_cache.block_size);
                 crate::ops::attention(&mut attn_outs[t], &qs[t], kv_cache, l, seq_len, t, num_heads, num_kv_heads, head_dim);
             }
         }
@@ -191,6 +193,7 @@ pub struct ModelExecutor {
     pub model: Arc<Model>,
     pub thermal_coordinator: ThermalCoordinator,
     pub prefetcher: LscPrefetcher,
+    pub policy: PolicyEngine,
     // Tensor cache for non-linear operations (RMSNorm weights and embeddings)
     pub token_embd: Vec<f32>,
     pub attn_norms: Vec<Vec<f32>>,
@@ -219,10 +222,21 @@ impl ModelExecutor {
         }
         let output_norm = model.gguf.dequantize_tensor_alloc(model.gguf.tensor_or_err("output_norm.weight").unwrap()).unwrap();
 
+        // Load LuaJIT thermal policy; fall back to defaults if file not found
+        let policy_paths = [
+            "policies/default.lua",
+            "../policies/default.lua",
+            "/etc/swamp/policy.lua",
+        ];
+        let policy = policy_paths.iter().find_map(|path| {
+            PolicyEngine::new(path, 6).ok()
+        }).unwrap_or_else(|| PolicyEngine::new("", 6).unwrap()); // empty path = no script, all fallbacks
+
         Self {
             model,
             thermal_coordinator,
             prefetcher,
+            policy,
             token_embd,
             attn_norms,
             ffn_norms,
@@ -268,19 +282,20 @@ impl ModelExecutor {
         let output_norm = self.output_norm.clone();
         let model = self.model.clone();
 
-        // Determina numero de threads UMA vez antes de entrar no blocking, baseado na coerencia (LSC)
+        // Determina numero de threads via PolicyEngine (LuaJIT), com fallback para LSC
         let c_epsilon = self.thermal_coordinator.coherence();
-        let n_threads = if self.thermal_coordinator.is_throttling() || c_epsilon < 0.6 {
-            1
-        } else if c_epsilon < 0.86 {
-            2
-        } else {
-            6
-        };
+        let temp_celsius = self.thermal_coordinator.current_temp as f64;
+        let freq_mhz = self.thermal_coordinator.current_freq_khz() / 1000;
+        let n_threads = self.policy.adapt_threads(c_epsilon, temp_celsius, freq_mhz);
+        let policy_path = self.policy.script_path().to_string();
 
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             use crate::linear::{forward_linear, forward_linear_multi};
             use crate::ops::{rmsnorm, silu, add_in_place, mul_in_place, apply_rope_ufc};
+
+            // Local PolicyEngine for hot-reload inside the blocking thread
+            let local_policy = PolicyEngine::new(&policy_path, n_threads)
+                .unwrap_or_else(|_| PolicyEngine::new("", n_threads).unwrap());
 
             // Per-layer profiler (HLC timestamps)
             let mut profiler = crate::hlc::ProfileSink::new();
@@ -386,6 +401,11 @@ impl ModelExecutor {
 
                 let total_steps = req.max_tokens + prompt_tokens.len() - 1;
                 for step in prefill_pos..total_steps {
+                    // Hot-reload check: try to reload Lua policy every 10 steps
+                    if step % 10 == 0 {
+                        local_policy.try_reload();
+                    }
+
                     let token_id = if step < prompt_tokens.len() {
                         prompt_tokens[step]
                     } else {
@@ -399,6 +419,11 @@ impl ModelExecutor {
 
                     // Forward Pass: Camadas
                     for l in 0..num_layers {
+                        // Policy check: skip layer if thermal conditions require it
+                        if local_policy.should_skip_layer(l, temp_celsius) {
+                            continue;
+                        }
+
                         #[cfg(feature = "gpu")]
                         let mut layer_profile = profiler.begin_layer(l, per_layer_gpu.is_some());
                         #[cfg(not(feature = "gpu"))]
@@ -426,6 +451,9 @@ impl ModelExecutor {
                         kv_cache.save(l, &k, &v);
                         let seq_len = kv_cache.current_pos() + 1;
 
+                        // Pre-heat KV pages from cold storage before parallel attention
+                        kv_cache.ensure_pages_hot(0, seq_len / kv_cache.block_size);
+
                         // Attention: async stream-based GPU path via M:N scheduler
                         #[cfg(feature = "gpu")]
                         {
@@ -446,11 +474,11 @@ impl ModelExecutor {
                                 synced
                             });
                             if !gpu_ok {
-                                crate::ops::attention(&mut attn_out, &q, &kv_cache, l, seq_len, pos, num_heads, num_kv_heads, head_dim);
+                                crate::ops::attention(&mut attn_out, &q, &mut kv_cache, l, seq_len, pos, num_heads, num_kv_heads, head_dim);
                             }
                         }
                         #[cfg(not(feature = "gpu"))]
-                        crate::ops::attention(&mut attn_out, &q, &kv_cache, l, seq_len, pos, num_heads, num_kv_heads, head_dim);
+                        crate::ops::attention(&mut attn_out, &q, &mut kv_cache, l, seq_len, pos, num_heads, num_kv_heads, head_dim);
 
                         // Output Projection
                         forward_linear(&model.gguf, model.gguf.tensor_or_err(&format!("blk.{}.attn_output.weight", l))?, &attn_out, &mut wo_out, n_threads)?;

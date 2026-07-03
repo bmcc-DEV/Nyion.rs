@@ -82,7 +82,7 @@ fn apply_rotation_pair(vec: &mut [f32], cos_sin: &[[f32; 2]], half_dim: usize) {
 pub fn attention(
     out: &mut [f32],
     q: &[f32],
-    kv_cache: &crate::cache::PagedKVCache,
+    kv_cache: &mut crate::cache::PagedKVCache,
     layer_idx: usize,
     seq_len: usize,
     q_pos: usize,
@@ -94,6 +94,10 @@ pub fn attention(
     let n_rep = n_heads / n_kv_heads;
     let valid_end = q_pos.min(seq_len - 1);
     let block_size = kv_cache.block_size;
+
+    // Pre-heat all pages that attention will touch
+    let end_page = valid_end / block_size;
+    kv_cache.ensure_pages_hot(0, end_page);
 
     out.par_chunks_mut(head_dim)
        .enumerate()
@@ -220,7 +224,7 @@ pub fn add_in_place(a: &mut [f32], b: &[f32]) {
 pub fn gpu_attention_forward(
     out: &mut [f32],
     q: &[f32],
-    kv_cache: &crate::cache::PagedKVCache,
+    kv_cache: &mut crate::cache::PagedKVCache,
     layer_idx: usize,
     seq_len: usize,
     _q_pos: usize,
