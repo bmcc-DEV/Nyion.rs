@@ -1,0 +1,858 @@
+// swamp-gpu/kernels/fused_attention.cu
+// GPU-accelerated fused attention for LLamanyon.rs
+// Target: sm_75 (GTX 1650 Mobile, Turing, no Tensor Cores)
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cooperative_groups.h>
+#include <stdio.h>
+
+namespace cg = cooperative_groups;
+
+// ---------------------------------------------------------------------------
+// Templated attention kernels: T_KV = float or half for KV cache
+// ---------------------------------------------------------------------------
+
+// Kernel 1: compute QK^T scores with scaling
+// Each thread computes score[h, t] = Q[h, :] @ K[kv_h, t, :] * scale
+// Grid: (n_heads, seq_len)
+// Block: 128 threads, each thread handles one (head, t) pair
+template<typename T_KV>
+__global__ void kernel_scores(
+    const float* __restrict__ q,        // [n_heads, head_dim]
+    const T_KV* __restrict__ k_cache,   // [n_kv_heads, k_stride, head_dim]
+    float* __restrict__ scores,         // [n_heads, seq_len]
+    int n_heads,
+    int n_kv_heads,
+    int seq_len,
+    int head_dim,
+    int k_stride,
+    float scale
+) {
+    int h = blockIdx.x;   // query head
+    int t = blockIdx.y;   // key position
+
+    if (h >= n_heads || t >= seq_len) return;
+
+    int kv_h = h * n_kv_heads / n_heads;
+
+    const float* q_row  = q + h * head_dim;
+    const T_KV* k_row  = k_cache + ((size_t)kv_h * k_stride + t) * head_dim;
+
+    float dot = 0.0f;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        dot += q_row[d] * (float)k_row[d];
+    }
+
+    // Warp reduce
+    for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+        dot += __shfl_xor_sync(0xffffffff, dot, offset);
+    }
+
+    // Block reduce
+    __shared__ float shared[32]; // one per warp
+    int warp_id = threadIdx.x / warpSize;
+    int lane   = threadIdx.x % warpSize;
+    if (lane == 0) shared[warp_id] = dot;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        dot = (threadIdx.x < blockDim.x / warpSize) ? shared[threadIdx.x] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+            dot += __shfl_xor_sync(0xffffffff, dot, offset);
+        }
+        if (threadIdx.x == 0) {
+            scores[h * seq_len + t] = dot * scale;
+        }
+    }
+}
+
+// Kernel 2: fused softmax + weighted sum of V
+// Each block handles one head
+// Threads: head_dim per block (64), each thread computes one output element
+template<typename T_KV>
+__global__ void kernel_softmax_weighted_sum(
+    const float* __restrict__ scores,   // [n_heads, seq_len]
+    const T_KV* __restrict__ v_cache,   // [n_kv_heads, v_stride, head_dim]
+    float* __restrict__ output,         // [n_heads, head_dim]
+    int n_heads,
+    int n_kv_heads,
+    int seq_len,
+    int head_dim,
+    int v_stride
+) {
+    int h = blockIdx.x;
+    if (h >= n_heads) return;
+
+    int kv_h = h * n_kv_heads / n_heads;
+    int d = threadIdx.x;
+
+    // Shared memory for scores: seq_len floats (up to 2048 = 8KB, fits in 48KB shared)
+    extern __shared__ float sh_scores[];
+
+    // Cooperative group for this block
+    auto g = cg::this_thread_block();
+
+    // Each thread loads multiple score values
+    for (int t = d; t < seq_len; t += blockDim.x) {
+        sh_scores[t] = scores[h * seq_len + t];
+    }
+    g.sync();
+
+    // Online softmax
+    float max_val = -1e10f;
+    for (int t = 0; t < seq_len; t++) {
+        max_val = fmaxf(max_val, sh_scores[t]);
+    }
+
+    float sum_exp = 0.0f;
+    for (int t = 0; t < seq_len; t++) {
+        sum_exp += __expf(sh_scores[t] - max_val);
+    }
+    float inv_sum = 1.0f / sum_exp;
+
+    // Weighted sum of V
+    float acc = 0.0f;
+    const T_KV* v_base = v_cache + (size_t)kv_h * v_stride * head_dim;
+
+    for (int t = 0; t < seq_len; t++) {
+        float prob = __expf(sh_scores[t] - max_val) * inv_sum;
+        acc += prob * (float)v_base[t * head_dim + d];
+    }
+
+    output[h * head_dim + d] = acc;
+}
+
+// ---------------------------------------------------------------------------
+// Host-callable C API
+// ---------------------------------------------------------------------------
+
+extern "C" {
+
+// Initialize CUDA context on device 0
+int gpu_init() {
+    cudaError_t err = cudaSetDevice(0);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_init: cudaSetDevice failed: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+
+    // Pre-warm by creating a context
+    cudaFree(0);
+    return 0;
+}
+
+// Allocate device memory
+void* gpu_alloc(size_t bytes) {
+    void* ptr = NULL;
+    cudaError_t err = cudaMalloc(&ptr, bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_alloc(%zu) failed: %s\n", bytes, cudaGetErrorString(err));
+        return NULL;
+    }
+    return ptr;
+}
+
+// Free device memory
+void gpu_free(void* ptr) {
+    cudaFree(ptr);
+}
+
+// Copy from host to device
+int gpu_copy_to_device(void* dst, const void* src, size_t bytes) {
+    cudaError_t err = cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_copy_to_device failed: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+    return 0;
+}
+
+// Copy from device to host
+int gpu_copy_to_host(void* dst, const void* src, size_t bytes) {
+    cudaError_t err = cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_copy_to_host failed: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+    return 0;
+}
+
+// Synchronize device
+int gpu_sync() {
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_sync failed: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+    return 0;
+}
+
+// Device-pointer attention: assumes all pointers are already on GPU.
+// Only allocates internal temp buffer for scores.
+// kv_stride: striding between kv_head blocks (seq_len for contiguous, max_seq_len for persistent)
+int gpu_attention_device(
+    const float* d_q,         // device: [n_heads, head_dim]
+    const float* d_k_cache,   // device: [n_kv_heads, kv_stride, head_dim]
+    const float* d_v_cache,   // device: [n_kv_heads, kv_stride, head_dim]
+    float* d_output,          // device: [n_heads, head_dim]
+    int n_heads,
+    int n_kv_heads,
+    int seq_len,
+    int head_dim,
+    int kv_stride
+) {
+    float scale = 1.0f / sqrtf((float)head_dim);
+    size_t scores_size = n_heads * seq_len * sizeof(float);
+
+    float *d_scores = NULL;
+    cudaError_t err = cudaMalloc(&d_scores, scores_size);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_attention_device: cudaMalloc scores failed: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+
+    // Kernel 1: scores
+    dim3 grid_scores(n_heads, seq_len);
+    kernel_scores<float><<<grid_scores, 128>>>(d_q, d_k_cache, d_scores,
+                                        n_heads, n_kv_heads, seq_len, head_dim, kv_stride, scale);
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "kernel_scores launch failed: %s\n", cudaGetErrorString(err));
+        cudaFree(d_scores);
+        return -1;
+    }
+
+    // Kernel 2: softmax + weighted sum
+    int shared_mem_size = seq_len * sizeof(float);
+    kernel_softmax_weighted_sum<float><<<n_heads, head_dim, shared_mem_size>>>(
+        d_scores, d_v_cache, d_output,
+        n_heads, n_kv_heads, seq_len, head_dim, kv_stride
+    );
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "kernel_softmax_weighted_sum launch failed: %s\n", cudaGetErrorString(err));
+        cudaFree(d_scores);
+        return -1;
+    }
+
+    cudaFree(d_scores);
+    return 0;
+}
+
+// Allocate persistent KV buffers on GPU: [n_kv_heads, max_seq_len, head_dim]
+// Returns device pointer, writes size to *out_bytes
+void* gpu_alloc_kv_buffer(int n_kv_heads, int max_seq_len, int head_dim, size_t* out_bytes) {
+    size_t bytes = (size_t)n_kv_heads * max_seq_len * head_dim * sizeof(float);
+    void* ptr = NULL;
+    cudaError_t err = cudaMalloc(&ptr, bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_alloc_kv_buffer failed: %s\n", cudaGetErrorString(err));
+        if (out_bytes) *out_bytes = 0;
+        return NULL;
+    }
+    if (out_bytes) *out_bytes = bytes;
+    return ptr;
+}
+
+// Copy a single (kv_head, pos) K/V entry from host to GPU buffer
+// d_buf: device buffer [n_kv_heads, max_seq_len, head_dim]
+// h_src: host source [num_kv_heads, head_dim] (one position's worth, but only head_dim elements used)
+int gpu_copy_kv_to_buffer(
+    float* d_buf,
+    const float* h_src,
+    int kv_head,
+    int pos,
+    int n_kv_heads,
+    int max_seq_len,
+    int head_dim
+) {
+    size_t offset = ((size_t)kv_head * max_seq_len + pos) * head_dim;
+    cudaError_t err = cudaMemcpy(
+        d_buf + offset,
+        h_src,
+        (size_t)head_dim * sizeof(float),
+        cudaMemcpyHostToDevice
+    );
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_copy_kv_to_buffer failed: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+    return 0;
+}
+
+// Copy an entire layer position (all kv_heads) from host to GPU buffer in one call
+// h_src: host source [n_kv_heads, head_dim] contiguous
+int gpu_copy_kv_layer(
+    float* d_buf,
+    const float* h_src,
+    int pos,
+    int n_kv_heads,
+    int max_seq_len,
+    int head_dim
+) {
+    for (int kv_h = 0; kv_h < n_kv_heads; kv_h++) {
+        size_t offset = ((size_t)kv_h * max_seq_len + pos) * head_dim;
+        cudaError_t err = cudaMemcpy(
+            d_buf + offset,
+            h_src + kv_h * head_dim,
+            (size_t)head_dim * sizeof(float),
+            cudaMemcpyHostToDevice
+        );
+        if (err != cudaSuccess) {
+            fprintf(stderr, "gpu_copy_kv_layer (kv_h=%d) failed: %s\n", kv_h, cudaGetErrorString(err));
+            return -1;
+        }
+    }
+    return 0;
+}
+
+// Copy Q from host to GPU (small, can be done per layer)
+void* gpu_alloc_and_copy_q(const float* h_q, int n_heads, int head_dim) {
+    size_t bytes = (size_t)n_heads * head_dim * sizeof(float);
+    void* d_q = NULL;
+    cudaError_t err = cudaMalloc(&d_q, bytes);
+    if (err != cudaSuccess) return NULL;
+    err = cudaMemcpy(d_q, h_q, bytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) { cudaFree(d_q); return NULL; }
+    return d_q;
+}
+
+// Copy output from GPU to host
+int gpu_copy_output_to_host(float* h_out, const float* d_out, int n_heads, int head_dim) {
+    size_t bytes = (size_t)n_heads * head_dim * sizeof(float);
+    cudaError_t err = cudaMemcpy(h_out, d_out, bytes, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_copy_output_to_host failed: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+    return 0;
+}
+
+// Original host-pointer version (kept for backward compat / testing)
+int gpu_attention_forward(
+    const float* q,         // [n_heads, head_dim]
+    const float* k_cache,   // [n_kv_heads, seq_len, head_dim]
+    const float* v_cache,   // [n_kv_heads, seq_len, head_dim]
+    float* output,          // [n_heads, head_dim]
+    int n_heads,
+    int n_kv_heads,
+    int seq_len,
+    int head_dim
+) {
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    size_t q_size      = n_heads * head_dim * sizeof(float);
+    size_t kv_size     = n_kv_heads * seq_len * head_dim * sizeof(float);
+    size_t scores_size = n_heads * seq_len * sizeof(float);
+    size_t out_size    = n_heads * head_dim * sizeof(float);
+
+    float *d_q = NULL, *d_k = NULL, *d_v = NULL;
+    float *d_scores = NULL, *d_out = NULL;
+
+    cudaMalloc(&d_q, q_size);
+    cudaMalloc(&d_k, kv_size);
+    cudaMalloc(&d_v, kv_size);
+    cudaMalloc(&d_scores, scores_size);
+    cudaMalloc(&d_out, out_size);
+
+    if (!d_q || !d_k || !d_v || !d_scores || !d_out) {
+        fprintf(stderr, "gpu_attention_forward: cudaMalloc failed\n");
+        cudaFree(d_q); cudaFree(d_k); cudaFree(d_v);
+        cudaFree(d_scores); cudaFree(d_out);
+        return -1;
+    }
+
+    cudaMemcpy(d_q, q, q_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, k_cache, kv_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, v_cache, kv_size, cudaMemcpyHostToDevice);
+
+    dim3 grid_scores(n_heads, seq_len);
+    kernel_scores<float><<<grid_scores, 128>>>(d_q, d_k, d_scores,
+                                        n_heads, n_kv_heads, seq_len, head_dim, seq_len, scale);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "kernel_scores launch failed: %s\n", cudaGetErrorString(err));
+        cudaFree(d_q); cudaFree(d_k); cudaFree(d_v);
+        cudaFree(d_scores); cudaFree(d_out);
+        return -1;
+    }
+
+    int shared_mem_size = seq_len * sizeof(float);
+    kernel_softmax_weighted_sum<float><<<n_heads, head_dim, shared_mem_size>>>(
+        d_scores, d_v, d_out,
+        n_heads, n_kv_heads, seq_len, head_dim, seq_len
+    );
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "kernel_softmax_weighted_sum launch failed: %s\n", cudaGetErrorString(err));
+        cudaFree(d_q); cudaFree(d_k); cudaFree(d_v);
+        cudaFree(d_scores); cudaFree(d_out);
+        return -1;
+    }
+
+    cudaMemcpy(output, d_out, out_size, cudaMemcpyDeviceToHost);
+    cudaDeviceSynchronize();
+
+    cudaFree(d_q); cudaFree(d_k); cudaFree(d_v);
+    cudaFree(d_scores); cudaFree(d_out);
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// CUDA Stream API (for async/overlapped GPU execution)
+// ---------------------------------------------------------------------------
+
+cudaStream_t gpu_stream_create() {
+    cudaStream_t stream;
+    cudaError_t err = cudaStreamCreate(&stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_stream_create failed: %s\n", cudaGetErrorString(err));
+        return NULL;
+    }
+    return stream;
+}
+
+void gpu_stream_destroy(cudaStream_t stream) {
+    if (stream) cudaStreamDestroy(stream);
+}
+
+int gpu_stream_synchronize(cudaStream_t stream) {
+    cudaError_t err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_stream_synchronize failed: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+    return 0;
+}
+
+// Async copy: host -> device on given stream
+// h_src must be page-locked (pinned) for true async behavior
+int gpu_copy_to_device_async(void* dst, const void* src, size_t bytes, cudaStream_t stream) {
+    cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_copy_to_device_async failed: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+    return 0;
+}
+
+// Async copy: device -> host on given stream
+int gpu_copy_to_host_async(void* dst, const void* src, size_t bytes, cudaStream_t stream) {
+    cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_copy_to_host_async failed: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+    return 0;
+}
+
+// Async batch KV copy: copy all kv_heads for one position to GPU K/V buffer
+int gpu_copy_kv_layer_async(
+    float* d_buf,
+    const float* h_src,
+    int pos,
+    int n_kv_heads,
+    int max_seq_len,
+    int head_dim,
+    cudaStream_t stream
+) {
+    for (int kv_h = 0; kv_h < n_kv_heads; kv_h++) {
+        size_t offset = ((size_t)kv_h * max_seq_len + pos) * head_dim;
+        cudaError_t err = cudaMemcpyAsync(
+            d_buf + offset,
+            h_src + kv_h * head_dim,
+            (size_t)head_dim * sizeof(float),
+            cudaMemcpyHostToDevice,
+            stream
+        );
+        if (err != cudaSuccess) {
+            fprintf(stderr, "gpu_copy_kv_layer_async (kv_h=%d) failed: %s\n", kv_h, cudaGetErrorString(err));
+            return -1;
+        }
+    }
+    return 0;
+}
+
+// Stream-based attention: Q already on device, uses given streams
+int gpu_attention_streamed(
+    const float* d_q,         // device: [n_heads, head_dim]
+    const float* d_k_cache,   // device: [n_kv_heads, kv_stride, head_dim]
+    const float* d_v_cache,   // device: [n_kv_heads, kv_stride, head_dim]
+    float* d_output,          // device: [n_heads, head_dim]
+    int n_heads,
+    int n_kv_heads,
+    int seq_len,
+    int head_dim,
+    int kv_stride,
+    cudaStream_t stream       // compute stream for kernels
+) {
+    float scale = 1.0f / sqrtf((float)head_dim);
+    size_t scores_size = n_heads * seq_len * sizeof(float);
+
+    float *d_scores = NULL;
+    cudaError_t err = cudaMalloc(&d_scores, scores_size);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_attention_streamed: cudaMalloc scores failed: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+
+    dim3 grid_scores(n_heads, seq_len);
+    kernel_scores<float><<<grid_scores, 128, 0, stream>>>(d_q, d_k_cache, d_scores,
+                                        n_heads, n_kv_heads, seq_len, head_dim, kv_stride, scale);
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "kernel_scores launch (streamed) failed: %s\n", cudaGetErrorString(err));
+        cudaFree(d_scores);
+        return -1;
+    }
+
+    int shared_mem_size = seq_len * sizeof(float);
+    kernel_softmax_weighted_sum<float><<<n_heads, head_dim, shared_mem_size, stream>>>(
+        d_scores, d_v_cache, d_output,
+        n_heads, n_kv_heads, seq_len, head_dim, kv_stride
+    );
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "kernel_softmax_weighted_sum launch (streamed) failed: %s\n", cudaGetErrorString(err));
+        cudaFree(d_scores);
+        return -1;
+    }
+
+    cudaFree(d_scores);
+    return 0;
+}
+
+// Stream-based attention with FP16 KV cache
+int gpu_attention_streamed_half(
+    const float* d_q,           // device: [n_heads, head_dim]
+    const half* d_k_cache,      // device: [n_kv_heads, kv_stride, head_dim]
+    const half* d_v_cache,      // device: [n_kv_heads, kv_stride, head_dim]
+    float* d_output,            // device: [n_heads, head_dim]
+    int n_heads,
+    int n_kv_heads,
+    int seq_len,
+    int head_dim,
+    int kv_stride,
+    cudaStream_t stream
+) {
+    float scale = 1.0f / sqrtf((float)head_dim);
+    size_t scores_size = n_heads * seq_len * sizeof(float);
+
+    float *d_scores = NULL;
+    cudaError_t err = cudaMalloc(&d_scores, scores_size);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_attention_streamed_half: cudaMalloc scores failed: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+
+    dim3 grid_scores(n_heads, seq_len);
+    kernel_scores<half><<<grid_scores, 128, 0, stream>>>(d_q, d_k_cache, d_scores,
+                                        n_heads, n_kv_heads, seq_len, head_dim, kv_stride, scale);
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "kernel_scores<half> launch failed: %s\n", cudaGetErrorString(err));
+        cudaFree(d_scores);
+        return -1;
+    }
+
+    int shared_mem_size = seq_len * sizeof(float);
+    kernel_softmax_weighted_sum<half><<<n_heads, head_dim, shared_mem_size, stream>>>(
+        d_scores, d_v_cache, d_output,
+        n_heads, n_kv_heads, seq_len, head_dim, kv_stride
+    );
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "kernel_softmax_weighted_sum<half> launch failed: %s\n", cudaGetErrorString(err));
+        cudaFree(d_scores);
+        return -1;
+    }
+
+    cudaFree(d_scores);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// CUDA Graph API: capture attention compute into a reusable graph
+// Eliminates kernel launch overhead for repeated attention calls
+// ---------------------------------------------------------------------------
+
+// Create a CUDA Graph executable for the attention compute pipeline.
+// All device pointers are fixed (pre-allocated buffers).
+// Uses max_seq throughout; actual seq_len is set via set_params before each replay.
+// Returns opaque handle, writes output parameters.
+
+// Create a CUDA Graph executable for attention compute.
+// All parameters (including seq_len) are FIXED at graph creation time.
+// Caller should cache graphs by seq_len and create one per distinct value.
+void* gpu_graph_create_attention(
+    const float* d_q, const float* d_k_cache, const float* d_v_cache,
+    float* d_scores, float* d_output,
+    int n_heads, int n_kv_heads, int seq_len, int head_dim, int kv_stride
+) {
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+
+    cudaGraph_t graph;
+    cudaGraphCreate(&graph, 0);
+
+    float scale = 1.0f / sqrtf((float)head_dim);
+    dim3 grid_scores(n_heads, seq_len);
+    int shared_mem_softmax = seq_len * sizeof(float);
+
+    // Capture kernel launches into the graph
+    cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+
+    kernel_scores<float><<<grid_scores, 128, 0, stream>>>(
+        d_q, d_k_cache, d_scores,
+        n_heads, n_kv_heads, seq_len, head_dim, kv_stride, scale
+    );
+
+    kernel_softmax_weighted_sum<float><<<n_heads, head_dim, shared_mem_softmax, stream>>>(
+        d_scores, d_v_cache, d_output,
+        n_heads, n_kv_heads, seq_len, head_dim, kv_stride
+    );
+
+    cudaError_t err = cudaStreamEndCapture(stream, &graph);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_graph_create: cudaStreamEndCapture failed: %s\n", cudaGetErrorString(err));
+        cudaStreamDestroy(stream);
+        return NULL;
+    }
+
+    // Instantiate the executable graph
+    cudaGraphExec_t graph_exec;
+    err = cudaGraphInstantiate(&graph_exec, graph, NULL, NULL, 0);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_graph_create: cudaGraphInstantiate failed: %s\n", cudaGetErrorString(err));
+        cudaGraphDestroy(graph);
+        cudaStreamDestroy(stream);
+        return NULL;
+    }
+
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(stream);
+    return (void*)graph_exec;
+}
+
+// Replay a fixed-parameter attention graph.
+// All parameters must match the graph creation parameters exactly.
+// Returns 0 on success, -1 on error.
+int gpu_graph_replay_attention(
+    void* graph_handle,
+    cudaStream_t stream
+) {
+    cudaGraphExec_t graph_exec = (cudaGraphExec_t)graph_handle;
+    cudaError_t err = cudaGraphLaunch(graph_exec, stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_graph_replay: cudaGraphLaunch failed: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+    return 0;
+}
+
+// Destroy a CUDA Graph executable
+void gpu_graph_destroy(void* graph_handle) {
+    if (graph_handle) {
+        cudaGraphExecDestroy((cudaGraphExec_t)graph_handle);
+    }
+}
+
+// Create a CUDA Graph executable for attention with FP16 KV cache.
+void* gpu_graph_create_attention_half(
+    const float* d_q, const half* d_k_cache, const half* d_v_cache,
+    float* d_scores, float* d_output,
+    int n_heads, int n_kv_heads, int seq_len, int head_dim, int kv_stride
+) {
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+
+    cudaGraph_t graph;
+    cudaGraphCreate(&graph, 0);
+
+    float scale = 1.0f / sqrtf((float)head_dim);
+    dim3 grid_scores(n_heads, seq_len);
+    int shared_mem_softmax = seq_len * sizeof(float);
+
+    cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+
+    kernel_scores<half><<<grid_scores, 128, 0, stream>>>(
+        d_q, d_k_cache, d_scores,
+        n_heads, n_kv_heads, seq_len, head_dim, kv_stride, scale
+    );
+
+    kernel_softmax_weighted_sum<half><<<n_heads, head_dim, shared_mem_softmax, stream>>>(
+        d_scores, d_v_cache, d_output,
+        n_heads, n_kv_heads, seq_len, head_dim, kv_stride
+    );
+
+    cudaError_t err = cudaStreamEndCapture(stream, &graph);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_graph_create_half: cudaStreamEndCapture failed: %s\n", cudaGetErrorString(err));
+        cudaStreamDestroy(stream);
+        return NULL;
+    }
+
+    cudaGraphExec_t graph_exec;
+    err = cudaGraphInstantiate(&graph_exec, graph, NULL, NULL, 0);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_graph_create_half: cudaGraphInstantiate failed: %s\n", cudaGetErrorString(err));
+        cudaGraphDestroy(graph);
+        cudaStreamDestroy(stream);
+        return NULL;
+    }
+
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(stream);
+    return (void*)graph_exec;
+}
+
+// ---------------------------------------------------------------------------
+// FP16 KV cache support
+// ---------------------------------------------------------------------------
+
+// Strided scatter kernel: copy contiguous float → strided half
+// src: contiguous [n_kv_heads * head_dim] floats (GPU staging)
+// dst: [n_kv_heads, max_seq_len, head_dim] half, writes at position `pos` for each kv_head
+__global__ void copy_float_to_half_strided(
+    const float* __restrict__ src,
+    half* __restrict__ dst,
+    int pos,
+    int n_kv_heads,
+    int max_seq_len,
+    int head_dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_kv_heads * head_dim;
+    if (idx >= total) return;
+    int kv_h = idx / head_dim;
+    int d = idx % head_dim;
+    size_t dst_offset = ((size_t)kv_h * max_seq_len + pos) * head_dim + d;
+    dst[dst_offset] = __float2half(src[idx]);
+}
+
+// Pre-allocated staging buffer for float→half conversion (lazily allocated)
+static float* g_half_staging = NULL;
+static size_t g_half_staging_size = 0;
+
+// Allocate persistent half-precision KV buffer: [n_kv_heads, max_seq_len, head_dim]
+void* gpu_alloc_kv_buffer_half(int n_kv_heads, int max_seq_len, int head_dim, size_t* out_bytes) {
+    size_t num_elements = (size_t)n_kv_heads * max_seq_len * head_dim;
+    size_t bytes = num_elements * sizeof(half);
+    void* ptr = NULL;
+    cudaError_t err = cudaMalloc(&ptr, bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_alloc_kv_buffer_half failed: %s\n", cudaGetErrorString(err));
+        if (out_bytes) *out_bytes = 0;
+        return NULL;
+    }
+    if (out_bytes) *out_bytes = bytes;
+    return ptr;
+}
+
+// Async copy float host data → half GPU buffer for one layer position (all kv_heads).
+// Uses a reusable GPU staging buffer for float→half conversion.
+int gpu_copy_kv_layer_async_half(
+    half* d_buf,
+    const float* h_src,
+    int pos,
+    int n_kv_heads,
+    int max_seq_len,
+    int head_dim,
+    cudaStream_t stream
+) {
+    size_t layer_elements = (size_t)n_kv_heads * head_dim;
+    size_t layer_bytes_float = layer_elements * sizeof(float);
+
+    // Ensure staging buffer is large enough
+    if (g_half_staging == NULL || g_half_staging_size < layer_bytes_float) {
+        if (g_half_staging) cudaFree(g_half_staging);
+        cudaError_t err = cudaMalloc(&g_half_staging, layer_bytes_float);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "gpu_copy_kv_layer_async_half: cudaMalloc staging failed: %s\n", cudaGetErrorString(err));
+            g_half_staging = NULL;
+            g_half_staging_size = 0;
+            return -1;
+        }
+        g_half_staging_size = layer_bytes_float;
+    }
+
+    // Copy host float → device staging
+    cudaError_t err = cudaMemcpyAsync(
+        g_half_staging, h_src, layer_bytes_float,
+        cudaMemcpyHostToDevice, stream
+    );
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_copy_kv_layer_async_half: cudaMemcpyAsync failed: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+
+    // Launch strided scatter kernel: staging (float) → d_buf at position (half)
+    dim3 conv_grid((layer_elements + 255) / 256);
+    copy_float_to_half_strided<<<conv_grid, 256, 0, stream>>>(
+        g_half_staging, d_buf, pos, n_kv_heads, max_seq_len, head_dim
+    );
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_copy_kv_layer_async_half: strided scatter failed: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+
+    return 0;
+}
+
+
+// CUDA event API for HLC (Hybrid Logical Clock) correlation
+cudaEvent_t gpu_event_create() {
+    cudaEvent_t event;
+    cudaError_t err = cudaEventCreate(&event);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_event_create failed: %s\n", cudaGetErrorString(err));
+        return NULL;
+    }
+    return event;
+}
+
+int gpu_event_record(cudaEvent_t event, cudaStream_t stream) {
+    cudaError_t err = cudaEventRecord(event, stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_event_record failed: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+    return 0;
+}
+
+int gpu_event_synchronize(cudaEvent_t event) {
+    cudaError_t err = cudaEventSynchronize(event);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_event_synchronize failed: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+    return 0;
+}
+
+float gpu_event_elapsed_ms(cudaEvent_t start, cudaEvent_t end) {
+    float ms = 0.0f;
+    cudaError_t err = cudaEventElapsedTime(&ms, start, end);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_event_elapsed_ms failed: %s\n", cudaGetErrorString(err));
+        return -1.0f;
+    }
+    return ms;
+}
+
+void gpu_event_destroy(cudaEvent_t event) {
+    cudaEventDestroy(event);
+}
+
+} // extern "C"

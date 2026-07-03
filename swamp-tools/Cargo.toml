@@ -1,0 +1,37 @@
+[package]
+name = "swamp-tools"
+version = "0.1.0"
+edition = "2021"
+description = "LLamañón.rs - ferramentas CLI para inspecionar e manipular modelos GGUF"
+
+[[bin]]
+name = "swamp-inspect"
+path = "src/bin/inspect.rs"
+
+[[bin]]
+name = "swamp-benchmark"
+path = "src/bin/benchmark.rs"
+
+[[bin]]
+name = "swamp-benchmark-fused"
+path = "src/bin/benchmark_fused.rs"
+
+[[bin]]
+name = "swamp-benchmark-prefill"
+path = "src/bin/benchmark_prefill.rs"
+
+[[bin]]
+name = "benchmark-q4k-batched"
+path = "src/bin/benchmark_q4k_batched.rs"
+
+[features]
+gpu = ["swamp-engine/gpu", "dep:swamp-gpu"]
+
+[dependencies]
+swamp-gguf    = { path = "../swamp-gguf" }
+swamp-engine  = { path = "../swamp-engine" }
+swamp-kernels = { path = "../swamp-kernels" }
+swamp-gpu = { path = "../swamp-gpu", optional = true }
+anyhow = { workspace = true }
+clap   = { workspace = true }
+half   = { workspace = true }

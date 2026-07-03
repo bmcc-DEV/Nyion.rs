@@ -1,0 +1,10 @@
+[package]
+name = "swamp-tensors"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+swamp-gguf = { path = "../swamp-gguf" }
+anyhow = { workspace = true }
+half = { workspace = true }
+libc = { workspace = true }

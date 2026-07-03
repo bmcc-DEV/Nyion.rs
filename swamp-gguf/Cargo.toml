@@ -1,0 +1,14 @@
+[package]
+name = "swamp-gguf"
+version = "0.1.0"
+edition = "2021"
+description = "LLamañón.rs - GGUF parser + lazy dequantization, zero-copy mmap-based"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+memmap2 = { workspace = true }
+bytemuck = { workspace = true }
+half = { workspace = true }
+
+[dev-dependencies]

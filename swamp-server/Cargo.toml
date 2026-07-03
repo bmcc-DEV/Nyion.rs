@@ -1,0 +1,23 @@
+[package]
+name = "swamp-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "swamp-server"
+path = "src/main.rs"
+
+[dependencies]
+swamp-engine = { path = "../swamp-engine" }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+mlua = { workspace = true }
+prometheus = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+rand = { workspace = true }
+futures = "0.3"

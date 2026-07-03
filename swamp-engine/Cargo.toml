@@ -1,0 +1,24 @@
+[package]
+name = "swamp-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+swamp-gguf = { path = "../swamp-gguf" }
+swamp-tensors = { path = "../swamp-tensors" }
+swamp-kernels = { path = "../swamp-kernels" }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+rand = { workspace = true }
+rayon = "1.12.0"
+tokenizers = "0.23.1"
+serde = { workspace = true, features = ["derive"] }
+mlua = { workspace = true }
+tracing = { workspace = true }
+libc = "0.2"
+half = { workspace = true }
+swamp-gpu = { path = "../swamp-gpu", optional = true }
+
+[features]
+default = []
+gpu = ["swamp-gpu"]
