@@ -180,6 +180,41 @@ pub fn gpu_free_buffers(d_x: *mut f32, d_out: *mut f32) -> Result<()> {
     Ok(())
 }
 
+/// Sync copy host → device (no pinning needed)
+pub fn gpu_copy_to_device(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, bytes: usize) -> Result<()> {
+    let lib = try_lib()?;
+    let func: Symbol<unsafe extern "C" fn(*mut std::ffi::c_void, *const std::ffi::c_void, usize) -> i32> =
+        unsafe { lib.get(b"gpu_copy_to_device")? };
+    let ret = unsafe { func(dst, src, bytes) };
+    if ret != 0 { return Err(GpuError::KernelError(ret)); }
+    Ok(())
+}
+
+/// Sync copy device → host (no pinning needed)
+pub fn gpu_copy_to_host(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, bytes: usize) -> Result<()> {
+    let lib = try_lib()?;
+    let func: Symbol<unsafe extern "C" fn(*mut std::ffi::c_void, *const std::ffi::c_void, usize) -> i32> =
+        unsafe { lib.get(b"gpu_copy_to_host")? };
+    let ret = unsafe { func(dst, src, bytes) };
+    if ret != 0 { return Err(GpuError::KernelError(ret)); }
+    Ok(())
+}
+
+/// Async copy from device to host
+pub fn gpu_copy_to_host_async(
+    dst: *mut std::ffi::c_void,
+    src: *const std::ffi::c_void,
+    bytes: usize,
+    stream: CudaStream,
+) -> Result<()> {
+    let lib = try_lib()?;
+    let func: Symbol<unsafe extern "C" fn(*mut std::ffi::c_void, *const std::ffi::c_void, usize, *mut std::ffi::c_void) -> i32> =
+        unsafe { lib.get(b"gpu_copy_to_host_async")? };
+    let ret = unsafe { func(dst, src, bytes, stream.0) };
+    if ret != 0 { return Err(GpuError::KernelError(ret)); }
+    Ok(())
+}
+
 // ===========================================================================
 // Swamp Continuum: meta-kernel CUDA persistente
 // ===========================================================================
@@ -452,23 +487,6 @@ pub fn gpu_copy_to_device_async(
     let lib = try_lib()?;
     let func: Symbol<unsafe extern "C" fn(*mut std::ffi::c_void, *const std::ffi::c_void, usize, *mut std::ffi::c_void) -> i32> =
         unsafe { lib.get(b"gpu_copy_to_device_async")? };
-    let ret = unsafe { func(dst, src, bytes, stream.0) };
-    if ret != 0 {
-        return Err(GpuError::KernelError(ret));
-    }
-    Ok(())
-}
-
-/// Async copy device -> host on given stream
-pub fn gpu_copy_to_host_async(
-    dst: *mut std::ffi::c_void,
-    src: *const std::ffi::c_void,
-    bytes: usize,
-    stream: CudaStream,
-) -> Result<()> {
-    let lib = try_lib()?;
-    let func: Symbol<unsafe extern "C" fn(*mut std::ffi::c_void, *const std::ffi::c_void, usize, *mut std::ffi::c_void) -> i32> =
-        unsafe { lib.get(b"gpu_copy_to_host_async")? };
     let ret = unsafe { func(dst, src, bytes, stream.0) };
     if ret != 0 {
         return Err(GpuError::KernelError(ret));

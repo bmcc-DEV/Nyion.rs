@@ -1074,34 +1074,45 @@ __global__ void swamp_continuum(
     float* d_state,
     volatile int* shutdown_flag
 ) {
+    // Shared memory: thread 0 publica o opcode atual, todos os threads executam
+    __shared__ SwampOpcode shared_op;
+    __shared__ volatile int op_ready;
+
     while (true) {
         if (shutdown_flag && *shutdown_flag) return;
 
-        // Spin até ter opcode disponível
-        uint32_t tail = ring->tail;
-        uint32_t head = ring->head;
-        if (head == tail) {
-            __threadfence();
-            continue; // spin
+        // Thread 0: gerencia ring buffer
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+            uint32_t tail = ring->tail;
+            uint32_t head = ring->head;
+
+            if (head != tail) {
+                uint32_t slot = head & 1023;
+                shared_op = ring->slots[slot];
+                op_ready = 1;
+            } else {
+                op_ready = 0;
+            }
         }
 
-        uint32_t slot = head & 1023;
-        SwampOpcode op = ring->slots[slot];
+        __syncthreads();
 
-        // Executa opcode
-        switch (op.op) {
-            case 0: // GEMV_Q4K
-                exec_gemv_q4k(&op, d_w_base, d_state);
-                break;
-            case 1: // ATTN_SPARSE (placeholder)
-                break;
-            case 2: // SHUTDOWN
-                return;
+        if (!op_ready) continue;
+
+        // Todos os threads executam o GEMV
+        if (shared_op.op == 0) {
+            exec_gemv_q4k(&shared_op, d_w_base, d_state);
         }
-        __threadfence();
 
-        // Avança head (GPU consumiu)
-        ring->head = head + 1;
+        __syncthreads();
+
+        // Thread 0: avança head
+        if (threadIdx.x == 0) {
+            if (shared_op.op == 1) return; // SHUTDOWN
+            __threadfence_system();
+            ring->head = ring->head + 1;
+        }
     }
 }
 
@@ -1133,12 +1144,14 @@ void gpu_swamp_launch(
     swamp_continuum<<<1, 256, 0, stream>>>(d_ring, d_w_base, d_state, d_shutdown);
 }
 
-// Enfileira um opcode no ring buffer (chamado do host)
+// Enfileira opcode — usa tail local (CPU mantém cópia própria)
+// Chamada: host escreve opcode e incrementa tail via cudaMemcpy
 void gpu_swamp_enqueue(
     SwampRingBuffer* d_ring,
     int op_type, int layer_id,
     int x_off, int w_off, int out_off,
     int rows, int n_blocks,
+    unsigned int local_tail,     // CPU mantém e passa
     cudaStream_t stream
 ) {
     SwampOpcode op;
@@ -1151,24 +1164,19 @@ void gpu_swamp_enqueue(
     op.rows = rows;
     op.n_blocks = n_blocks;
 
-    // Lê tail atual do device para saber onde escrever
-    uint32_t tail;
-    cudaMemcpyAsync(&tail, (void*)(&d_ring->tail), sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
-
-    // Escreve opcode no slot
+    // Escreve opcode
     cudaMemcpyAsync(
-        &d_ring->slots[tail & 1023],
+        &d_ring->slots[local_tail & 1023],
         &op, sizeof(SwampOpcode),
         cudaMemcpyHostToDevice,
         stream
     );
 
-    // Incrementa tail (publica opcode)
-    uint32_t new_tail = tail + 1;
+    // Publica opcode (incrementa tail)
+    unsigned int new_tail = local_tail + 1;
     cudaMemcpyAsync(
         (void*)(&d_ring->tail),
-        &new_tail, sizeof(uint32_t),
+        &new_tail, sizeof(unsigned int),
         cudaMemcpyHostToDevice,
         stream
     );
@@ -1178,6 +1186,12 @@ void gpu_swamp_enqueue(
 void gpu_swamp_shutdown(int* d_shutdown, cudaStream_t stream) {
     int val = 1;
     cudaMemcpyAsync(d_shutdown, &val, sizeof(int), cudaMemcpyHostToDevice, stream);
+}
+
+// Sync stream (only if not already defined elsewhere)
+int gpu_stream_sync(cudaStream_t stream) {
+    cudaError_t e = cudaStreamSynchronize(stream);
+    return (int)e;
 }
 
 } // extern "C"

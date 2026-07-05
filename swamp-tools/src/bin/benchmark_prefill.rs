@@ -3,7 +3,7 @@ use clap::Parser;
 use anyhow::Result;
 use swamp_engine::Model;
 use swamp_engine::linear::forward_gemvs_ring;
-use swamp_gpu::{gpu_init, gpu_stream_create, gpu_upload_weights, gpu_swamp_init, gpu_swamp_launch, gpu_swamp_enqueue, gpu_swamp_shutdown};
+use swamp_gpu::{gpu_init, gpu_stream_create, gpu_upload_weights, gpu_swamp_init, gpu_swamp_launch, gpu_swamp_enqueue, gpu_swamp_shutdown, gpu_copy_to_device, gpu_copy_to_host};
 
 #[derive(Parser)]
 #[command(name = "swamp-benchmark-prefill")]
@@ -116,12 +116,16 @@ fn main() -> Result<()> {
                 if _use_gpu {
                     let layer_off: usize = layer_sizes[..l].iter().sum();
                     let w_base = (d_w as usize + layer_off) as i32;
-                    // Enqueue QKV opcodes (GPU executa, CPU continua em paralelo)
-                    unsafe {
-                        let _ = gpu_swamp_enqueue(d_ring, 0, l as i32, 0, w_base + ring.q_off as i32, 0x10000, ring.q_nr as i32, (ring.q_nc / 256) as i32, stream);
-                        let _ = gpu_swamp_enqueue(d_ring, 0, l as i32, 0, w_base + ring.k_off as i32, 0x20000, ring.k_nr as i32, (ring.k_nc / 256) as i32, stream);
-                        let _ = gpu_swamp_enqueue(d_ring, 0, l as i32, 0, w_base + ring.v_off as i32, 0x30000, ring.v_nr as i32, (ring.v_nc / 256) as i32, stream);
-                    }
+                    let embed_bytes = (model.config.embed_dim * 4) as usize;
+                    let q_bytes = (model.config.num_heads * head_dim * 4) as usize;
+                    let kv_bytes = (model.config.num_kv_heads * head_dim * 4) as usize;
+                    let _ = gpu_copy_to_device(d_state as *mut _, xn.as_ptr() as *const _, embed_bytes);
+                    let _ = gpu_swamp_enqueue(d_ring, 0, l as i32, 0, w_base + ring.q_off as i32, 0x10000, ring.q_nr as i32, (ring.q_nc / 256) as i32, stream);
+                    let _ = gpu_swamp_enqueue(d_ring, 0, l as i32, 0, w_base + ring.k_off as i32, 0x20000, ring.k_nr as i32, (ring.k_nc / 256) as i32, stream);
+                    let _ = gpu_swamp_enqueue(d_ring, 0, l as i32, 0, w_base + ring.v_off as i32, 0x30000, ring.v_nr as i32, (ring.v_nc / 256) as i32, stream);
+                    let _ = gpu_copy_to_host(q.as_mut_ptr() as *mut _, (d_state as usize + 0x10000) as *const _, q_bytes);
+                    let _ = gpu_copy_to_host(k.as_mut_ptr() as *mut _, (d_state as usize + 0x20000) as *const _, kv_bytes);
+                    let _ = gpu_copy_to_host(v.as_mut_ptr() as *mut _, (d_state as usize + 0x30000) as *const _, kv_bytes);
                 } else {
                     swamp_engine::linear::forward_gemvs_ring(&mut [
                         (ring.q_slice(), &xn, &mut q, ring.q_nr, ring.q_nc, ring.q_bs),
@@ -138,7 +142,10 @@ fn main() -> Result<()> {
                 if _use_gpu {
                     let layer_off: usize = layer_sizes[..l].iter().sum();
                     let w_base = (d_w as usize + layer_off) as i32;
-                    unsafe { let _ = gpu_swamp_enqueue(d_ring, 0, l as i32, 0x40000, w_base + ring.o_off as i32, 0x50000, ring.o_nr as i32, (ring.o_nc / 256) as i32, stream); }
+                    let embed_bytes = (model.config.embed_dim * 4) as usize;
+                    let _ = gpu_copy_to_device((d_state as usize + 0x40000) as *mut _, ao.as_ptr() as *const _, embed_bytes);
+                    let _ = gpu_swamp_enqueue(d_ring, 0, l as i32, 0x40000, w_base + ring.o_off as i32, 0x50000, ring.o_nr as i32, (ring.o_nc / 256) as i32, stream);
+                    let _ = gpu_copy_to_host(wo.as_mut_ptr() as *mut _, (d_state as usize + 0x50000) as *const _, embed_bytes);
                 } else {
                     swamp_engine::linear::forward_gemvs_ring(&mut [
                         (ring.o_slice(), &ao, &mut wo, ring.o_nr, ring.o_nc, ring.o_bs),
@@ -149,10 +156,13 @@ fn main() -> Result<()> {
                 if _use_gpu {
                     let layer_off: usize = layer_sizes[..l].iter().sum();
                     let w_base = (d_w as usize + layer_off) as i32;
-                    unsafe {
-                        let _ = gpu_swamp_enqueue(d_ring, 0, l as i32, 0x60000, w_base + ring.gate_off as i32, 0x70000, ring.gate_nr as i32, (ring.gate_nc / 256) as i32, stream);
-                        let _ = gpu_swamp_enqueue(d_ring, 0, l as i32, 0x60000, w_base + ring.up_off as i32, 0x80000, ring.up_nr as i32, (ring.up_nc / 256) as i32, stream);
-                    }
+                    let embed_bytes = (model.config.embed_dim * 4) as usize;
+                    let ffn_bytes = (ffn_dim * 4) as usize;
+                    let _ = gpu_copy_to_device((d_state as usize + 0x60000) as *mut _, xn.as_ptr() as *const _, embed_bytes);
+                    let _ = gpu_swamp_enqueue(d_ring, 0, l as i32, 0x60000, w_base + ring.gate_off as i32, 0x70000, ring.gate_nr as i32, (ring.gate_nc / 256) as i32, stream);
+                    let _ = gpu_swamp_enqueue(d_ring, 0, l as i32, 0x60000, w_base + ring.up_off as i32, 0x80000, ring.up_nr as i32, (ring.up_nc / 256) as i32, stream);
+                    let _ = gpu_copy_to_host(fg.as_mut_ptr() as *mut _, (d_state as usize + 0x70000) as *const _, ffn_bytes);
+                    let _ = gpu_copy_to_host(fu.as_mut_ptr() as *mut _, (d_state as usize + 0x80000) as *const _, ffn_bytes);
                 } else {
                     swamp_engine::linear::forward_gemvs_ring(&mut [
                         (ring.gate_slice(), &xn, &mut fg, ring.gate_nr, ring.gate_nc, ring.gate_bs),
@@ -164,7 +174,11 @@ fn main() -> Result<()> {
                 if _use_gpu {
                     let layer_off: usize = layer_sizes[..l].iter().sum();
                     let w_base = (d_w as usize + layer_off) as i32;
-                    unsafe { let _ = gpu_swamp_enqueue(d_ring, 0, l as i32, 0x90000, w_base + ring.down_off as i32, 0xA0000, ring.down_nr as i32, (ring.down_nc / 256) as i32, stream); }
+                    let ffn_bytes = (ffn_dim * 4) as usize;
+                    let embed_bytes = (model.config.embed_dim * 4) as usize;
+                    let _ = gpu_copy_to_device((d_state as usize + 0x90000) as *mut _, fg.as_ptr() as *const _, ffn_bytes);
+                    let _ = gpu_swamp_enqueue(d_ring, 0, l as i32, 0x90000, w_base + ring.down_off as i32, 0xA0000, ring.down_nr as i32, (ring.down_nc / 256) as i32, stream);
+                    let _ = gpu_copy_to_host(fd.as_mut_ptr() as *mut _, (d_state as usize + 0xA0000) as *const _, embed_bytes);
                 } else {
                     swamp_engine::linear::forward_gemvs_ring(&mut [
                         (ring.down_slice(), &fg, &mut fd, ring.down_nr, ring.down_nc, ring.down_bs),
