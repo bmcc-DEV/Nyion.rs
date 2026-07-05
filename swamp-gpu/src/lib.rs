@@ -180,6 +180,63 @@ pub fn gpu_free_buffers(d_x: *mut f32, d_out: *mut f32) -> Result<()> {
     Ok(())
 }
 
+// ===========================================================================
+// Swamp Continuum: meta-kernel CUDA persistente
+// ===========================================================================
+
+/// Initialize swamp continuum: ring buffer + state buffer + shutdown flag
+pub fn gpu_swamp_init(
+    d_ring: *mut *mut std::ffi::c_void,
+    d_state: *mut *mut f32,
+    d_shutdown: *mut *mut i32,
+    stream: CudaStream,
+) -> Result<()> {
+    let lib = try_lib()?;
+    let func: Symbol<unsafe extern "C" fn(*mut *mut std::ffi::c_void, *mut *mut f32, *mut *mut i32, CudaStream)> =
+        unsafe { lib.get(b"gpu_swamp_init")? };
+    unsafe { func(d_ring, d_state, d_shutdown, stream) };
+    Ok(())
+}
+
+/// Launch the persistent kernel (never returns — runs in loop)
+pub fn gpu_swamp_launch(
+    d_ring: *const std::ffi::c_void,
+    d_w_base: *const u8,
+    d_state: *mut f32,
+    d_shutdown: *const i32,
+    stream: CudaStream,
+) -> Result<()> {
+    let lib = try_lib()?;
+    let func: Symbol<unsafe extern "C" fn(*const std::ffi::c_void, *const u8, *mut f32, *const i32, CudaStream)> =
+        unsafe { lib.get(b"gpu_swamp_launch")? };
+    unsafe { func(d_ring, d_w_base, d_state, d_shutdown, stream) };
+    Ok(())
+}
+
+/// Enqueue an opcode for the persistent kernel
+pub fn gpu_swamp_enqueue(
+    d_ring: *const std::ffi::c_void,
+    op_type: i32, layer_id: i32,
+    x_off: i32, w_off: i32, out_off: i32,
+    rows: i32, n_blocks: i32,
+    stream: CudaStream,
+) -> Result<()> {
+    let lib = try_lib()?;
+    let func: Symbol<unsafe extern "C" fn(*const std::ffi::c_void, i32, i32, i32, i32, i32, i32, i32, CudaStream)> =
+        unsafe { lib.get(b"gpu_swamp_enqueue")? };
+    unsafe { func(d_ring, op_type, layer_id, x_off, w_off, out_off, rows, n_blocks, stream) };
+    Ok(())
+}
+
+/// Signal shutdown to the persistent kernel
+pub fn gpu_swamp_shutdown(d_shutdown: *const i32, stream: CudaStream) -> Result<()> {
+    let lib = try_lib()?;
+    let func: Symbol<unsafe extern "C" fn(*const i32, CudaStream)> =
+        unsafe { lib.get(b"gpu_swamp_shutdown")? };
+    unsafe { func(d_shutdown, stream) };
+    Ok(())
+}
+
 /// Allocate device memory (raw bytes)
 pub unsafe fn gpu_alloc(bytes: usize) -> Result<*mut std::ffi::c_void> {
     let lib = try_lib()?;

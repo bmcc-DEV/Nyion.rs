@@ -984,4 +984,200 @@ void gpu_free_buffers(float* d_x, float* d_out) {
     cudaFree(d_x);
     cudaFree(d_out);
 }
+// ===========================================================================
+// Swamp Continuum: meta-kernel CUDA persistente
+// Lê opcodes de um ring buffer em device memory. Nunca retorna.
+// CPU publica opcodes de 32 bytes. GPU interpreta e executa.
+// ===========================================================================
+
+struct __align__(32) SwampOpcode {
+    uint8_t  op;             // 0=GEMV_Q4K, 1=ATTN_SPARSE, 2=FFN_SILU_MUL
+    uint8_t  flags;
+    uint16_t layer_id;
+    uint32_t x_offset;       // offset no buffer persistente de input
+    uint32_t w_offset;       // offset nos pesos Q4_K
+    uint32_t out_offset;     // offset no buffer persistente de output
+    uint16_t rows;
+    uint16_t cols;
+    uint16_t n_blocks;
+    uint16_t head_dim;
+    uint8_t  reserved[6];
+};
+
+// Ring buffer produtor-consumidor (GPU lê, CPU escreve)
+struct SwampRingBuffer {
+    volatile uint32_t head;   // GPU consumiu até aqui
+    volatile uint32_t tail;   // CPU escreveu até aqui
+    SwampOpcode slots[1024];  // opcodes circulares
+};
+
+// Buffer persistente de estados (x, out) — GPU mantém entre opcodes
+#define MAX_STATE_SIZE (4 * 1024 * 1024) // 4MB de estados em VRAM
+
+// ---------------------------------------------------------------------------
+// Processa um opcode GEMV_Q4K
+// ---------------------------------------------------------------------------
+__device__ void exec_gemv_q4k(
+    const SwampOpcode* op,
+    const uint8_t* d_w_base,
+    float* d_state
+) {
+    const uint8_t* w = d_w_base + op->w_offset;
+    float* x = d_state + op->x_offset;
+    float* out = d_state + op->out_offset;
+    int n_rows = op->rows;
+    int n_blocks = op->n_blocks;
+
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+
+    float total = 0.0f;
+    for (int blk = 0; blk < n_blocks; blk++) {
+        const uint8_t* blk_ptr = w + ((size_t)row * n_blocks + blk) * 144;
+        half d_h = *reinterpret_cast<const half*>(blk_ptr);
+        half dmin_h = *reinterpret_cast<const half*>(blk_ptr + 2);
+        float d = __half2float(d_h);
+        float dmin = __half2float(dmin_h);
+
+        float scales[8], mins[8];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            scales[j] = (blk_ptr[4 + j] & 63);
+            mins[j]   = (blk_ptr[8 + j] & 63);
+        }
+        #pragma unroll
+        for (int j = 4; j < 8; j++) {
+            scales[j] = (blk_ptr[8 + j] & 0xF) | ((blk_ptr[4 + j - 4] >> 6) << 4);
+            mins[j]   = (blk_ptr[8 + j] >> 4) | ((blk_ptr[4 + j] >> 6) << 4);
+        }
+
+        const uint8_t* qs = blk_ptr + 16;
+        float dot = 0.0f;
+        for (int sb = 0; sb < 8; sb++) {
+            for (int k = 0; k < 32; k++) {
+                int nib = (qs[sb * 16 + k / 2] >> ((k % 2) * 4)) & 0x0F;
+                float w_val = d * (nib - 8) * scales[sb] + dmin * mins[sb];
+                dot += w_val * x[blk * 256 + sb * 32 + k];
+            }
+        }
+        total += dot;
+    }
+    out[row] = total;
+}
+
+// ---------------------------------------------------------------------------
+// Persistent kernel: processa opcodes em loop infinito
+// ---------------------------------------------------------------------------
+__global__ void swamp_continuum(
+    SwampRingBuffer* ring,
+    const uint8_t* d_w_base,
+    float* d_state,
+    volatile int* shutdown_flag
+) {
+    while (true) {
+        if (shutdown_flag && *shutdown_flag) return;
+
+        // Spin até ter opcode disponível
+        uint32_t tail = ring->tail;
+        uint32_t head = ring->head;
+        if (head == tail) {
+            __threadfence();
+            continue; // spin
+        }
+
+        uint32_t slot = head & 1023;
+        SwampOpcode op = ring->slots[slot];
+
+        // Executa opcode
+        switch (op.op) {
+            case 0: // GEMV_Q4K
+                exec_gemv_q4k(&op, d_w_base, d_state);
+                break;
+            case 1: // ATTN_SPARSE (placeholder)
+                break;
+            case 2: // SHUTDOWN
+                return;
+        }
+        __threadfence();
+
+        // Avança head (GPU consumiu)
+        ring->head = head + 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host-callable wrappers
+// ---------------------------------------------------------------------------
+
+void gpu_swamp_init(
+    SwampRingBuffer** d_ring,
+    float** d_state,
+    int** d_shutdown,
+    cudaStream_t stream
+) {
+    cudaMalloc((void**)d_ring, sizeof(SwampRingBuffer));
+    cudaMemset((void*)*d_ring, 0, sizeof(SwampRingBuffer));
+    cudaMalloc((void**)d_state, MAX_STATE_SIZE);
+    cudaMemset((void*)*d_state, 0, MAX_STATE_SIZE);
+    cudaMalloc((void**)d_shutdown, sizeof(int));
+    cudaMemset((void*)*d_shutdown, 0, sizeof(int));
+}
+
+void gpu_swamp_launch(
+    SwampRingBuffer* d_ring,
+    const uint8_t* d_w_base,
+    float* d_state,
+    int* d_shutdown,
+    cudaStream_t stream
+) {
+    swamp_continuum<<<1, 256, 0, stream>>>(d_ring, d_w_base, d_state, d_shutdown);
+}
+
+// Enfileira um opcode no ring buffer (chamado do host)
+void gpu_swamp_enqueue(
+    SwampRingBuffer* d_ring,
+    int op_type, int layer_id,
+    int x_off, int w_off, int out_off,
+    int rows, int n_blocks,
+    cudaStream_t stream
+) {
+    SwampOpcode op;
+    memset(&op, 0, sizeof(op));
+    op.op = op_type;
+    op.layer_id = layer_id;
+    op.x_offset = x_off;
+    op.w_offset = w_off;
+    op.out_offset = out_off;
+    op.rows = rows;
+    op.n_blocks = n_blocks;
+
+    // Lê tail atual do device para saber onde escrever
+    uint32_t tail;
+    cudaMemcpyAsync(&tail, (void*)(&d_ring->tail), sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+
+    // Escreve opcode no slot
+    cudaMemcpyAsync(
+        &d_ring->slots[tail & 1023],
+        &op, sizeof(SwampOpcode),
+        cudaMemcpyHostToDevice,
+        stream
+    );
+
+    // Incrementa tail (publica opcode)
+    uint32_t new_tail = tail + 1;
+    cudaMemcpyAsync(
+        (void*)(&d_ring->tail),
+        &new_tail, sizeof(uint32_t),
+        cudaMemcpyHostToDevice,
+        stream
+    );
+}
+
+// Sinaliza shutdown do kernel persistente
+void gpu_swamp_shutdown(int* d_shutdown, cudaStream_t stream) {
+    int val = 1;
+    cudaMemcpyAsync(d_shutdown, &val, sizeof(int), cudaMemcpyHostToDevice, stream);
+}
+
 } // extern "C"
