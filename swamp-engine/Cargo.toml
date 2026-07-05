@@ -15,8 +15,8 @@ tokenizers = "0.23.1"
 serde = { workspace = true, features = ["derive"] }
 mlua = { workspace = true }
 tracing = { workspace = true }
-libc = "0.2"
 half = { workspace = true }
+libc = { workspace = true }
 swamp-gpu = { path = "../swamp-gpu", optional = true }
 
 [features]

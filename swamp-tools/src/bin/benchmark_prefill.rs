@@ -2,6 +2,7 @@ use std::time::Instant;
 use clap::Parser;
 use anyhow::Result;
 use swamp_engine::Model;
+use swamp_engine::linear::forward_gemvs_ring;
 
 #[derive(Parser)]
 #[command(name = "swamp-benchmark-prefill")]
@@ -63,63 +64,64 @@ fn main() -> Result<()> {
             n_threads);
         let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
+        // 10 decode steps com ring dispatch (pre-quant kernel + MSR unlock)
+        let decode_steps = 10usize;
+        let mut x = last_x;
+        let mut xn = vec![0.0f32; model.config.embed_dim];
+        let mut q = vec![0.0f32; model.config.num_heads * head_dim];
+        let mut k = vec![0.0f32; model.config.num_kv_heads * head_dim];
+        let mut v = vec![0.0f32; model.config.num_kv_heads * head_dim];
+        let mut ao = vec![0.0f32; model.config.embed_dim];
+        let mut wo = vec![0.0f32; model.config.embed_dim];
+        let mut fg = vec![0.0f32; ffn_dim];
+        let mut fu = vec![0.0f32; ffn_dim];
+        let mut fd = vec![0.0f32; model.config.embed_dim];
+        let mut pos = args.prompt_tokens;
+
         let t1 = Instant::now();
-        {
-            let mut x = last_x;
-            let mut xn = vec![0.0f32; model.config.embed_dim];
-            let mut q = vec![0.0f32; model.config.num_heads * head_dim];
-            let mut k = vec![0.0f32; model.config.num_kv_heads * head_dim];
-            let mut v = vec![0.0f32; model.config.num_kv_heads * head_dim];
-            let mut ao = vec![0.0f32; model.config.embed_dim];
-            let mut wo = vec![0.0f32; model.config.embed_dim];
-            let mut fg = vec![0.0f32; ffn_dim];
-            let mut fu = vec![0.0f32; ffn_dim];
-            let mut fd = vec![0.0f32; model.config.embed_dim];
-            let mut logits = vec![0.0f32; model.config.vocab_size];
-
+        for _step in 0..decode_steps {
             for l in 0..num_layers {
-                let q_t = model.gguf.tensor_or_err(&format!("blk.{}.attn_q.weight", l))?;
-                let k_t = model.gguf.tensor_or_err(&format!("blk.{}.attn_k.weight", l))?;
-                let v_t = model.gguf.tensor_or_err(&format!("blk.{}.attn_v.weight", l))?;
-                let o_t = model.gguf.tensor_or_err(&format!("blk.{}.attn_output.weight", l))?;
-                let gt = model.gguf.tensor_or_err(&format!("blk.{}.ffn_gate.weight", l))?;
-                let ut = model.gguf.tensor_or_err(&format!("blk.{}.ffn_up.weight", l))?;
-                let dt = model.gguf.tensor_or_err(&format!("blk.{}.ffn_down.weight", l))?;
-
+                let ring = &model.layer_rings[l];
                 swamp_engine::ops::rmsnorm(&mut xn, &x, &attn_norms[l], 1e-5);
-                swamp_engine::linear::forward_linear_multi(
-                    &model.gguf, &[q_t, k_t, v_t], &xn, &mut [&mut q, &mut k, &mut v], n_threads)?;
-                swamp_engine::ops::apply_rope_ufc(&mut q, &mut k, args.prompt_tokens,
+                swamp_engine::linear::forward_gemvs_ring(&mut [
+                    (ring.q_slice(), &xn, &mut q, ring.q_nr, ring.q_nc, ring.q_bs),
+                    (ring.k_slice(), &xn, &mut k, ring.k_nr, ring.k_nc, ring.k_bs),
+                    (ring.v_slice(), &xn, &mut v, ring.v_nr, ring.v_nc, ring.v_bs),
+                ], n_threads);
+                swamp_engine::ops::apply_rope_ufc(&mut q, &mut k, pos,
                     model.config.num_heads, model.config.num_kv_heads, head_dim, model.config.context_len);
                 kv_cache.save(l, &k, &v);
-                let seq_len = kv_cache.current_pos() + 1;
-                swamp_engine::ops::attention(&mut ao, &q, &kv_cache, l, seq_len, args.prompt_tokens,
+                let seq_len = pos + 1;
+                swamp_engine::ops::attention(&mut ao, &q, &mut kv_cache, l, seq_len, pos,
                     model.config.num_heads, model.config.num_kv_heads, head_dim);
-                swamp_engine::linear::forward_linear(&model.gguf, o_t, &ao, &mut wo, n_threads)?;
+                swamp_engine::linear::forward_gemvs_ring(&mut [
+                    (ring.o_slice(), &ao, &mut wo, ring.o_nr, ring.o_nc, ring.o_bs),
+                ], n_threads);
                 swamp_engine::ops::add_in_place(&mut x, &wo);
                 swamp_engine::ops::rmsnorm(&mut xn, &x, &ffn_norms[l], 1e-5);
-                swamp_engine::linear::forward_linear_multi(
-                    &model.gguf, &[gt, ut], &xn, &mut [&mut fg, &mut fu], n_threads)?;
+                swamp_engine::linear::forward_gemvs_ring(&mut [
+                    (ring.gate_slice(), &xn, &mut fg, ring.gate_nr, ring.gate_nc, ring.gate_bs),
+                    (ring.up_slice(), &xn, &mut fu, ring.up_nr, ring.up_nc, ring.up_bs),
+                ], n_threads);
                 swamp_engine::ops::silu(&mut fg);
                 swamp_engine::ops::mul_in_place(&mut fg, &fu);
-                swamp_engine::linear::forward_linear(&model.gguf, dt, &fg, &mut fd, n_threads)?;
+                swamp_engine::linear::forward_gemvs_ring(&mut [
+                    (ring.down_slice(), &fg, &mut fd, ring.down_nr, ring.down_nc, ring.down_bs),
+                ], n_threads);
                 swamp_engine::ops::add_in_place(&mut x, &fd);
                 kv_cache.advance();
             }
-            swamp_engine::ops::rmsnorm(&mut xn, &x, &output_norm, 1e-5);
-            swamp_engine::linear::forward_linear(
-                &model.gguf, model.gguf.tensor_or_err("output.weight")?,
-                &xn, &mut logits, n_threads)?;
+            pos += 1;
+            x.copy_from_slice(&token_embd[1 * model.config.embed_dim..(1 + 1) * model.config.embed_dim]);
         }
         let decode_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
-        let auto_reg_est = decode_ms * args.prompt_tokens as f64;
-        println!("--- Repeat {} ---", rep + 1);
+        let per_token = decode_ms / decode_steps as f64;
+        println!("--- Repeat {} (ring dispatch) ---", rep + 1);
         println!("  Prefill TTFT: {:.1}ms ({:.0} tok/s)", prefill_ms,
             args.prompt_tokens as f64 / (prefill_ms / 1000.0));
-        println!("  Single decode: {:.1}ms", decode_ms);
-        println!("  Est. auto-regressive {}toks: {:.1}s", args.prompt_tokens, auto_reg_est / 1000.0);
-        println!("  Prefill speedup vs auto-regressive: {:.0}x", auto_reg_est / prefill_ms);
+        println!("  Decode: {:.1}ms for {} tokens ({:.1} ms/tok, {:.0} tok/s)",
+            decode_ms, decode_steps, per_token, decode_steps as f64 / (decode_ms / 1000.0));
     }
     Ok(())
 }

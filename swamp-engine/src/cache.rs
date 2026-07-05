@@ -22,6 +22,10 @@ pub struct PagedKVCache {
     // Page storage — k_pages[i] / v_pages[i] podem ser null se a pagina foi evictada
     k_pages: Vec<*mut f32>,
     v_pages: Vec<*mut f32>,
+    // 4-bit KV pages (16:1 compression for 1M context)
+    // Each page stores Q4_K blocks: each KV head × (head_dim/256) × 144 bytes
+    k_q4_pages: Vec<*mut u8>,
+    v_q4_pages: Vec<*mut u8>,
     page_capacities: Vec<(Layout, usize)>,
     page_state: Vec<PageState>,
 
@@ -83,6 +87,8 @@ impl PagedKVCache {
         Self {
             k_pages: Vec::with_capacity(num_pages),
             v_pages: Vec::with_capacity(num_pages),
+            k_q4_pages: Vec::with_capacity(num_pages),
+            v_q4_pages: Vec::with_capacity(num_pages),
             page_capacities: Vec::with_capacity(num_pages),
             page_state: Vec::with_capacity(num_pages),
             lru_prev: Vec::with_capacity(num_pages),
@@ -126,18 +132,31 @@ impl PagedKVCache {
         );
     }
 
+    /// Page byte size for 4-bit KV: per KV head, head_dim/32 blocks × 20 bytes/block, × block_size slots
+    fn q4_page_byte_size(&self) -> usize {
+        let blocks_per_head = (self.head_dim + 31) / 32;        // 32-value blocks
+        let bytes_per_head = blocks_per_head * 20;               // d(2)+dmin(2)+nibbles(16)
+        self.num_layers * self.num_kv_heads * self.block_size * bytes_per_head
+    }
+
     /// Alocar uma nova pagina Hot, adicionando-a ao LRU head.
     fn alloc_hot_page(&mut self) -> usize {
         let (layout, byte_size) = self.page_byte_size();
         let k_ptr = unsafe { alloc_zeroed(layout) } as *mut f32;
         let v_ptr = unsafe { alloc_zeroed(layout) } as *mut f32;
-        if k_ptr.is_null() || v_ptr.is_null() {
+        let q4_bytes = self.q4_page_byte_size();
+        let q4_layout = Layout::from_size_align(q4_bytes, 64).unwrap();
+        let k_q4_ptr = unsafe { alloc_zeroed(q4_layout) } as *mut u8;
+        let v_q4_ptr = unsafe { alloc_zeroed(q4_layout) } as *mut u8;
+        if k_ptr.is_null() || v_ptr.is_null() || k_q4_ptr.is_null() || v_q4_ptr.is_null() {
             panic!("PagedKVCache OOM at page {}", self.k_pages.len());
         }
 
         let page_id = self.k_pages.len();
         self.k_pages.push(k_ptr);
         self.v_pages.push(v_ptr);
+        self.k_q4_pages.push(k_q4_ptr);
+        self.v_q4_pages.push(v_q4_ptr);
         self.page_capacities.push((layout, byte_size));
         self.page_state.push(PageState::Hot);
         self.lru_prev.push(None);
@@ -345,6 +364,80 @@ impl PagedKVCache {
         ((layer * self.num_kv_heads + kv_head) * self.block_size + slot) * self.head_dim
     }
 
+    /// Quantize K/V to 4-bit and store in q4 pages (alongside f32 save).
+    /// Block format: 32 values → d(f16)+dmin(f16)+16 nibbles = 20 bytes.
+    pub fn save_q4(&mut self, layer: usize, k: &[f32], v: &[f32]) {
+        let pos = self.current_pos;
+        let pid = self.page_id(pos);
+        let slot = self.slot_in_page(pos);
+        self.ensure_page(pid);
+        let blocks_per_head = (self.head_dim + 31) / 32;
+        let bytes_per_head = blocks_per_head * 20;
+
+        for kv_head in 0..self.num_kv_heads {
+            let page_off = (layer * self.num_kv_heads + kv_head) * self.block_size * bytes_per_head
+                         + slot * bytes_per_head;
+            let src_off = kv_head * self.head_dim;
+            let k_src = &k[src_off..src_off + self.head_dim];
+            let v_src = &v[src_off..src_off + self.head_dim];
+
+            // Quantize in blocks of 32
+            for blk in 0..blocks_per_head {
+                let blk_start = blk * 32;
+                let blk_end = (blk_start + 32).min(self.head_dim);
+                let blk_len = blk_end - blk_start;
+
+                // Find max/min
+                let mut d_max = 0.0f32;
+                let mut d_min = f32::MAX;
+                for &val in &k_src[blk_start..blk_end] {
+                    d_max = d_max.max(val.abs());
+                    d_min = d_min.min(val);
+                }
+                let d = d_max / 7.0; // 3-bit magnitude + 1 sign = 4-bit centered
+                let dmin = d_min;
+
+                // Write d/dmin as f16
+                let d_bytes = half::f16::from_f32(d).to_le_bytes();
+                let dmin_bytes = half::f16::from_f32(dmin).to_le_bytes();
+                let q4_base = unsafe { self.k_q4_pages[pid].add(page_off + blk * 20) };
+                unsafe {
+                    std::ptr::write(q4_base as *mut u16, u16::from_le_bytes(d_bytes));
+                    std::ptr::write(q4_base.add(2) as *mut u16, u16::from_le_bytes(dmin_bytes));
+                    for i in 0..blk_len {
+                        let q = ((k_src[blk_start + i] - dmin) / d).round().max(0.0).min(15.0) as u8;
+                        let nib_off = q4_base.add(4 + i / 2);
+                        let shift = if i % 2 == 0 { 0 } else { 4 };
+                        std::ptr::write(nib_off, std::ptr::read(nib_off) | (q << shift));
+                    }
+                }
+
+                // Same for V
+                let mut d_max = 0.0f32;
+                for &val in &v_src[blk_start..blk_end] {
+                    d_max = d_max.max(val.abs());
+                }
+                let d_v = d_max / 7.0;
+                let dmin_v = v_src.iter().cloned().fold(f32::MAX, f32::min);
+                let d_bytes_v = half::f16::from_f32(d_v).to_le_bytes();
+                let dmin_bytes_v = half::f16::from_f32(dmin_v).to_le_bytes();
+                let v_q4_base = unsafe { self.v_q4_pages[pid].add(page_off + blk * 20) };
+                unsafe {
+                    std::ptr::write(v_q4_base as *mut u16, u16::from_le_bytes(d_bytes_v));
+                    std::ptr::write(v_q4_base.add(2) as *mut u16, u16::from_le_bytes(dmin_bytes_v));
+                    for i in 0..blk_len {
+                        let q = ((v_src[blk_start + i] - dmin_v) / d_v).round().max(0.0).min(15.0) as u8;
+                        let nib_off = v_q4_base.add(4 + i / 2);
+                        let shift = if i % 2 == 0 { 0 } else { 4 };
+                        std::ptr::write(nib_off, std::ptr::read(nib_off) | (q << shift));
+                    }
+                }
+            }
+        }
+        // Also save f32 for backward compat (will be removed when all paths use q4)
+        self.save(layer, k, v);
+    }
+
     pub fn save(&mut self, layer: usize, k: &[f32], v: &[f32]) {
         let pos = self.current_pos;
         let pid = self.page_id(pos);
@@ -398,6 +491,28 @@ impl PagedKVCache {
         assert!(self.k_pages[page_id] != std::ptr::null_mut(), "k_page_ptr on cold page {}", page_id);
         let off = self.offset_in_page(layer, kv_head, 0);
         unsafe { self.k_pages[page_id].add(off) as *const f32 }
+    }
+
+    /// Retorna ponteiro raw para K 4-bit — PANIC se a pagina estiver Cold.
+    /// Formato: por bloco de 32 valores: d(f16, 2B) + dmin(f16, 2B) + 16 bytes nibbles = 20B.
+    /// Por KV head: head_dim/32 blocos × 20B. Por pagina: num_layers × num_kv_heads × block_size × isso.
+    #[inline(always)]
+    pub fn k_q4_page_ptr(&self, layer: usize, kv_head: usize, page_id: usize) -> *const u8 {
+        assert!(self.k_q4_pages[page_id] != std::ptr::null_mut(), "k_q4_page_ptr on cold page {}", page_id);
+        let blocks_per_head = (self.head_dim + 31) / 32;
+        let bytes_per_head = blocks_per_head * 20;
+        let off = (layer * self.num_kv_heads + kv_head) * self.block_size * bytes_per_head;
+        unsafe { self.k_q4_pages[page_id].add(off) as *const u8 }
+    }
+
+    /// Retorna ponteiro raw para V 4-bit.
+    #[inline(always)]
+    pub fn v_q4_page_ptr(&self, layer: usize, kv_head: usize, page_id: usize) -> *const u8 {
+        assert!(self.v_q4_pages[page_id] != std::ptr::null_mut(), "v_q4_page_ptr on cold page {}", page_id);
+        let blocks_per_head = (self.head_dim + 31) / 32;
+        let bytes_per_head = blocks_per_head * 20;
+        let off = (layer * self.num_kv_heads + kv_head) * self.block_size * bytes_per_head;
+        unsafe { self.v_q4_pages[page_id].add(off) as *const u8 }
     }
 
     /// Retorna ponteiro raw para V — PANIC se a pagina estiver Cold.

@@ -79,6 +79,96 @@ fn apply_rotation_pair(vec: &mut [f32], cos_sin: &[[f32; 2]], half_dim: usize) {
     }
 }
 
+/// Sparse attention: window + global tokens.
+/// At seq_len=1M, attends to last `window` tokens + every `global_stride`-th older token.
+/// This reduces O(n²) to O(window × n_heads) per token.
+pub fn attention_sparse(
+    out: &mut [f32],
+    q: &[f32],
+    kv_cache: &mut crate::cache::PagedKVCache,
+    layer_idx: usize,
+    seq_len: usize,
+    q_pos: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    window: usize,
+    global_stride: usize,
+) {
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let n_rep = n_heads / n_kv_heads;
+    let valid_end = q_pos.min(seq_len - 1);
+    let block_size = kv_cache.block_size;
+
+    // Build sparse position list: last `window` + every `global_stride`-th older
+    let mut positions: Vec<usize> = Vec::with_capacity(window + 128);
+    let window_start = if valid_end > window { valid_end - window + 1 } else { 0 };
+    // Global tokens: sample evenly from [0, window_start)
+    let global_count = window_start / global_stride;
+    for gi in 0..global_count.min(128) {
+        positions.push(global_stride * gi);
+    }
+    // Window tokens
+    for t in window_start..=valid_end {
+        positions.push(t);
+    }
+
+    // Pre-heat pages
+    let end_page = valid_end / block_size;
+    kv_cache.ensure_pages_hot(0, end_page);
+
+    out.par_chunks_mut(head_dim)
+       .enumerate()
+       .for_each(|(h, out_head)| {
+            let kv_h = h / n_rep;
+            let q_ptr = unsafe { q.as_ptr().add(h * head_dim) };
+            let k = positions.len();
+
+            SCORES_BUF.with(|buf| {
+                let mut buf_ref = buf.borrow_mut();
+                if buf_ref.len() < k {
+                    buf_ref.resize(k, 0.0);
+                }
+                let scores = &mut buf_ref[..k];
+
+                // Score loop (sparse positions)
+                let mut max_score = f32::NEG_INFINITY;
+                for (idx, &t) in positions.iter().enumerate() {
+                    let pid = t / block_size;
+                    let page_start = pid * block_size;
+                    let k_page_base = kv_cache.k_page_ptr(layer_idx, kv_h, pid);
+                    let k_ptr = unsafe { k_page_base.add((t - page_start) * head_dim) };
+                    let score = unsafe { dot_product_raw(q_ptr, k_ptr, head_dim) * scale };
+                    scores[idx] = score;
+                    if score > max_score { max_score = score; }
+                }
+
+                // Softmax over sparse set
+                let mut sum_exp = 0.0f32;
+                for s in scores.iter_mut() {
+                    let e = (*s - max_score).exp();
+                    *s = e;
+                    sum_exp += e;
+                }
+                let inv_sum = 1.0 / sum_exp;
+                for s in scores.iter_mut() { *s *= inv_sum; }
+
+                // Weighted sum from sparse positions
+                unsafe {
+                    let out_ptr = out_head.as_mut_ptr();
+                    std::ptr::write_bytes(out_ptr, 0, head_dim);
+                    for (idx, &t) in positions.iter().enumerate() {
+                        let pid = t / block_size;
+                        let page_start = pid * block_size;
+                        let v_page_base = kv_cache.v_page_ptr(layer_idx, kv_h, pid);
+                        let v_ptr = v_page_base.add((t - page_start) * head_dim);
+                        weighted_sum_raw(out_ptr, v_ptr, scores[idx], head_dim);
+                    }
+                }
+            });
+        });
+}
+
 pub fn attention(
     out: &mut [f32],
     q: &[f32],
@@ -267,4 +357,136 @@ pub fn gpu_attention_forward(
         tracing::warn!("GPU attention failed, falling back to CPU: {:?}", e);
         attention(out, q, kv_cache, layer_idx, seq_len, _q_pos, n_heads, n_kv_heads, head_dim);
     }
+}
+
+/// Sparse attention with 4-bit KV cache.
+/// Reads K/V from q4 pages, dequantizes on-the-fly during score/weighted-sum.
+/// Window + global strategy identical to attention_sparse.
+pub fn attention_sparse_q4(
+    out: &mut [f32],
+    q: &[f32],
+    kv_cache: &mut crate::cache::PagedKVCache,
+    layer_idx: usize,
+    seq_len: usize,
+    q_pos: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    window: usize,
+    global_stride: usize,
+) {
+    use std::arch::x86_64::*;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let n_rep = n_heads / n_kv_heads;
+    let valid_end = q_pos.min(seq_len - 1);
+    let block_size = kv_cache.block_size;
+
+    // Build sparse positions
+    let mut positions: Vec<usize> = Vec::with_capacity(window + 128);
+    let window_start = if valid_end > window { valid_end - window + 1 } else { 0 };
+    let global_count = window_start / global_stride;
+    for gi in 0..global_count.min(128) {
+        positions.push(global_stride * gi);
+    }
+    for t in window_start..=valid_end { positions.push(t); }
+    let k = positions.len();
+
+    let blocks_per_head = (head_dim + 31) / 32;
+    let blk_bytes = 20; // d(2)+dmin(2)+nibbles(16)
+
+    out.par_chunks_mut(head_dim).enumerate().for_each(|(h, out_head)| {
+        let kv_h = h / n_rep;
+        let q_f32 = unsafe { std::slice::from_raw_parts(q.as_ptr().add(h * head_dim), head_dim) };
+        let mask_nib = unsafe { _mm_set1_epi8(0x0F) };
+
+        // Score loop over sparse positions (4-bit K, AVX-512 vectorized)
+        let mut scores = vec![0.0f32; k];
+        let mut max_score = f32::NEG_INFINITY;
+        for (idx, &t) in positions.iter().enumerate() {
+            let pid = t / block_size;
+            let slot = t % block_size;
+            let mut dot_acc = unsafe { _mm512_setzero_ps() };
+
+            for blk in 0..blocks_per_head {
+                let q4_page = kv_cache.k_q4_page_ptr(layer_idx, kv_h, pid);
+                let blk_off = (slot * blocks_per_head + blk) * blk_bytes;
+
+                unsafe {
+                    let base = q4_page.add(blk_off);
+                    let d = half::f16::from_le_bytes([*base, *base.add(1)]).to_f32();
+                    let dmin = half::f16::from_le_bytes([*base.add(2), *base.add(3)]).to_f32();
+                    let nib = base.add(4);
+                    let d_ps = _mm512_set1_ps(d);
+                    let dmin_ps = _mm512_set1_ps(dmin);
+
+                    // Load 16 nibble bytes, expand to 32 nibbles (low/high)
+                    let nib16 = _mm_loadu_si128(nib as *const __m128i);
+                    let nib_lo = _mm_and_si128(nib16, mask_nib);
+                    let nib_hi = _mm_and_si128(_mm_srli_epi16(nib16, 4), mask_nib);
+
+                    // Extend nibbles to float, dequantize, FMA dot with Q
+                    let k_f_lo = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(nib_lo));
+                    let k_f_hi = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(nib_hi));
+                    let k_val_lo = _mm512_fmadd_ps(d_ps, k_f_lo, dmin_ps);
+                    let k_val_hi = _mm512_fmadd_ps(d_ps, k_f_hi, dmin_ps);
+
+                    let q_lo = _mm512_loadu_ps(q_f32.as_ptr().add(blk * 32));
+                    let q_hi = _mm512_loadu_ps(q_f32.as_ptr().add(blk * 32 + 16));
+                    dot_acc = _mm512_fmadd_ps(k_val_lo, q_lo, dot_acc);
+                    dot_acc = _mm512_fmadd_ps(k_val_hi, q_hi, dot_acc);
+                }
+            }
+
+            // Horizontal reduction once per position
+            let mut tmp = [0.0f32; 16];
+            unsafe { _mm512_storeu_ps(tmp.as_mut_ptr(), dot_acc); }
+            let dot: f32 = tmp.iter().sum();
+            let score = dot * scale;
+            scores[idx] = score;
+            if score > max_score { max_score = score; }
+        }
+
+        // Softmax over sparse positions
+        let mut sum_exp = 0.0f32;
+        for s in scores.iter_mut() { let e = (*s - max_score).exp(); *s = e; sum_exp += e; }
+        let inv_sum = 1.0 / sum_exp;
+        for s in scores.iter_mut() { *s *= inv_sum; }
+
+        // Weighted sum from 4-bit V (AVX-512 vectorized)
+        unsafe { std::ptr::write_bytes(out_head.as_mut_ptr(), 0, head_dim); }
+        for (idx, &t) in positions.iter().enumerate() {
+            let pid = t / block_size;
+            let slot = t % block_size;
+            let w = scores[idx];
+            if w < 1e-8 { continue; }
+            let w_ps = unsafe { _mm512_set1_ps(w) };
+
+            for blk in 0..blocks_per_head {
+                let q4_page = kv_cache.v_q4_page_ptr(layer_idx, kv_h, pid);
+                let blk_off = (slot * blocks_per_head + blk) * blk_bytes;
+                unsafe {
+                    let base = q4_page.add(blk_off);
+                    let d = half::f16::from_le_bytes([*base, *base.add(1)]).to_f32();
+                    let dmin = half::f16::from_le_bytes([*base.add(2), *base.add(3)]).to_f32();
+                    let nib = base.add(4);
+                    let d_ps = _mm512_set1_ps(d);
+                    let dmin_ps = _mm512_set1_ps(dmin);
+
+                    let nib16 = _mm_loadu_si128(nib as *const __m128i);
+                    let nib_lo = _mm_and_si128(nib16, mask_nib);
+                    let nib_hi = _mm_and_si128(_mm_srli_epi16(nib16, 4), mask_nib);
+
+                    let v_f_lo = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(nib_lo));
+                    let v_f_hi = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(nib_hi));
+                    let v_val_lo = _mm512_fmadd_ps(d_ps, v_f_lo, dmin_ps);
+                    let v_val_hi = _mm512_fmadd_ps(d_ps, v_f_hi, dmin_ps);
+
+                    let out_lo = _mm512_loadu_ps(out_head.as_mut_ptr().add(blk * 32));
+                    let out_hi = _mm512_loadu_ps(out_head.as_mut_ptr().add(blk * 32 + 16));
+                    _mm512_storeu_ps(out_head.as_mut_ptr().add(blk * 32), _mm512_fmadd_ps(v_val_lo, w_ps, out_lo));
+                    _mm512_storeu_ps(out_head.as_mut_ptr().add(blk * 32 + 16), _mm512_fmadd_ps(v_val_hi, w_ps, out_hi));
+                }
+            }
+        }
+    });
 }

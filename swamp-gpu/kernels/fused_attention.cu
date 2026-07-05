@@ -855,4 +855,79 @@ void gpu_event_destroy(cudaEvent_t event) {
     cudaEventDestroy(event);
 }
 
+
+// ---------------------------------------------------------------------------
+// Q4_K GEMV: dequantize on-the-fly, VNNI-style dot product
+// Each block: 256 threads, each processes one output row
+// W: [n_rows, n_blocks * 144] Q4_K in VRAM
+// x: [n_cols] f32 activation
+// out: [n_rows] f32 output
+// ---------------------------------------------------------------------------
+__global__ void kernel_gemv_q4k(
+    const uint8_t* __restrict__ w,       // Q4_K weights in VRAM
+    const float*   __restrict__ x,       // activation vector
+    float*         __restrict__ out,     // output vector
+    int n_rows,
+    int n_blocks,
+    float scale_x,
+    float inv_scale_x
+) {
+    // x is pre-quantized to i8 on host, stored as f32 for simplicity
+    // Each thread processes 1 row
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+
+    float total = 0.0f;
+    for (int blk = 0; blk < n_blocks; blk++) {
+        const uint8_t* blk_ptr = w + ((size_t)row * n_blocks + blk) * 144;
+        
+        // Load d/dmin as f16
+        half d_h = *reinterpret_cast<const half*>(blk_ptr);
+        half dmin_h = *reinterpret_cast<const half*>(blk_ptr + 2);
+        float d = __half2float(d_h);
+        float dmin = __half2float(dmin_h);
+        
+        // Unpack scales (12 bytes → 8+8)
+        float scales[8], mins[8];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            scales[j] = (blk_ptr[4 + j] & 63);
+            mins[j]   = (blk_ptr[8 + j] & 63);
+        }
+        #pragma unroll
+        for (int j = 4; j < 8; j++) {
+            scales[j] = (blk_ptr[8 + j] & 0xF) | ((blk_ptr[4 + j - 4] >> 6) << 4);
+            mins[j]   = (blk_ptr[8 + j] >> 4) | ((blk_ptr[4 + j] >> 6) << 4);
+        }
+        
+        // Process 8 sub-blocks of 32 values each
+        const uint8_t* qs = blk_ptr + 16;
+        float dot = 0.0f;
+        float dot_corr = 0.0f;
+        
+        for (int sb = 0; sb < 8; sb++) {
+            float sum_x = 0.0f;
+            #pragma unroll
+            for (int k = 0; k < 32; k++) {
+                int nib = (qs[sb * 16 + k / 2] >> ((k % 2) * 4)) & 0x0F;
+                float w_val = d * (nib - 8) * scales[sb] + dmin * mins[sb];
+                float xk = x[blk * 256 + sb * 32 + k];
+                dot += w_val * xk;
+            }
+        }
+        total += dot;
+    }
+    out[row] = total;
+}
+
+void gpu_gemv_q4k(
+    const uint8_t* d_w, const float* d_x, float* d_out,
+    int n_rows, int n_blocks,
+    cudaStream_t stream
+) {
+    int threads = 256;
+    int blocks = (n_rows + threads - 1) / threads;
+    kernel_gemv_q4k<<<blocks, threads, 0, stream>>>(d_w, d_x, d_out, n_rows, n_blocks, 0.0f, 0.0f);
+}
+
 } // extern "C"

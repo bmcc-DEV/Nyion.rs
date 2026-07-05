@@ -106,6 +106,18 @@ pub fn gpu_attention_forward(
     Ok(())
 }
 
+/// Run Q4_K GEMV on GPU (dequantize on-the-fly)
+pub fn gpu_gemv_q4k(
+    d_w: *const u8, d_x: *const f32, d_out: *mut f32,
+    n_rows: i32, n_blocks: i32, stream: CudaStream,
+) -> Result<()> {
+    let lib = try_lib()?;
+    let func: Symbol<unsafe extern "C" fn(*const u8, *const f32, *mut f32, i32, i32, CudaStream)> =
+        unsafe { lib.get(b"gpu_gemv_q4k")? };
+    unsafe { func(d_w, d_x, d_out, n_rows, n_blocks, stream) };
+    Ok(())
+}
+
 /// Allocate device memory (raw bytes)
 pub unsafe fn gpu_alloc(bytes: usize) -> Result<*mut std::ffi::c_void> {
     let lib = try_lib()?;

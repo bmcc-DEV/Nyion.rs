@@ -19,7 +19,7 @@ pub mod policy;
 pub use cache::PagedKVCache;
 pub use executor::{ModelExecutor, InferenceRequest};
 pub use executor::prefill_batch;
-pub use linear::forward_linear;
+pub use linear::{forward_linear, forward_gemvs_ring};
 pub use lsc::LscPrefetcher;
 pub use model::{Model, ModelConfig};
 pub use sampler::Sampler;

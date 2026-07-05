@@ -362,3 +362,58 @@ fn fallback_gemv(raw: &[u8], xs: &[&[f32]], outputs: &mut [&mut [f32]],
         }
     });
 }
+
+// =========================================================================
+// Ring GEMV — raw &[u8] slices from per-layer ring buffer
+// =========================================================================
+
+/// Batched GEMV dispatch from ring slices. Each spec: (raw, x, out, n_rows, n_cols, block_size).
+pub fn forward_gemvs_ring(
+    specs: &mut [(&[u8], &[f32], &mut [f32], usize, usize, usize)],
+    n_threads: usize,
+) {
+    if specs.is_empty() { return; }
+
+    let max_nr = specs.iter().map(|s| s.3).max().unwrap_or(1);
+    let rpt = (max_nr + n_threads - 1) / n_threads;
+
+    struct RawSpec { raw_p: usize, x_p: usize, out_p: usize, nr: usize, nc: usize, bs: usize }
+    let mut rs: Vec<RawSpec> = Vec::with_capacity(specs.len());
+    for s in specs.iter_mut() {
+        rs.push(RawSpec {
+            raw_p: s.0.as_ptr() as usize,
+            x_p:   s.1.as_ptr() as usize,
+            out_p: s.2.as_mut_ptr() as usize,
+            nr:    s.3, nc: s.4, bs: s.5,
+        });
+    }
+
+    (0..n_threads).into_par_iter().for_each(|t| {
+        let row_s = t * rpt;
+        let row_e = (row_s + rpt).min(max_nr);
+        if row_s >= row_e { return; }
+
+        for spec in &rs {
+            if row_s >= spec.nr { continue; }
+            let re = row_e.min(spec.nr);
+            let rc = re - row_s;
+            let n_blocks = spec.nc / Q4K_BLOCK;
+            let row_bytes = n_blocks * spec.bs;
+            let raw_off = row_s * row_bytes;
+            let r = unsafe {
+                std::slice::from_raw_parts((spec.raw_p + raw_off) as *const u8, rc * row_bytes)
+            };
+            let o = unsafe {
+                std::slice::from_raw_parts_mut((spec.out_p + row_s * 4) as *mut f32, rc)
+            };
+            let xi = unsafe {
+                std::slice::from_raw_parts(spec.x_p as *const f32, spec.nc)
+            };
+            if spec.bs == 144 {
+                fused_gemv_q4k(r, xi, o, rc, spec.nc);
+            } else {
+                fused_gemv_q6k(r, xi, o, rc, spec.nc);
+            }
+        }
+    });
+}
