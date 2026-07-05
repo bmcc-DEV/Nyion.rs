@@ -118,6 +118,68 @@ pub fn gpu_gemv_q4k(
     Ok(())
 }
 
+/// Upload weights (ring buffer) to GPU VRAM
+pub fn gpu_upload_weights(h_w: *const u8, d_w: *mut *mut u8, bytes: usize, stream: CudaStream) -> Result<()> {
+    let lib = try_lib()?;
+    let func: Symbol<unsafe extern "C" fn(*const u8, *mut *mut u8, usize, CudaStream)> =
+        unsafe { lib.get(b"gpu_upload_weights")? };
+    unsafe { func(h_w, d_w, bytes, stream) };
+    Ok(())
+}
+
+/// Free GPU weights
+pub fn gpu_free_weights(d_w: *mut u8) -> Result<()> {
+    let lib = try_lib()?;
+    let func: Symbol<unsafe extern "C" fn(*mut u8)> =
+        unsafe { lib.get(b"gpu_free_weights")? };
+    unsafe { func(d_w) };
+    Ok(())
+}
+
+/// Full GPU GEMV: copy x to GPU, run kernel, copy result back
+pub fn gpu_gemv_q4k_full(
+    d_w: *const u8, h_x: &[f32], h_out: &mut [f32],
+    n_rows: i32, n_blocks: i32, stream: CudaStream,
+) -> Result<()> {
+    let lib = try_lib()?;
+    let func: Symbol<unsafe extern "C" fn(*const u8, *const f32, *mut f32, i32, i32, CudaStream)> =
+        unsafe { lib.get(b"gpu_gemv_q4k_full")? };
+    unsafe { func(d_w, h_x.as_ptr(), h_out.as_mut_ptr(), n_rows, n_blocks, stream) };
+    Ok(())
+}
+
+/// GPU GEMV with pre-allocated persistent buffers (no malloc per call)
+pub fn gpu_gemv_q4k_prealloc(
+    d_w: *const u8, h_x: &[f32], h_out: &mut [f32],
+    d_x: *mut f32, d_out: *mut f32,
+    n_rows: i32, n_blocks: i32, max_rows: i32, max_cols: i32,
+    stream: CudaStream,
+) -> Result<()> {
+    let lib = try_lib()?;
+    let func: Symbol<unsafe extern "C" fn(*const u8, *const f32, *mut f32, *mut f32, *mut f32, i32, i32, i32, i32, CudaStream)> =
+        unsafe { lib.get(b"gpu_gemv_q4k_prealloc")? };
+    unsafe { func(d_w, h_x.as_ptr(), h_out.as_mut_ptr(), d_x, d_out, n_rows, n_blocks, max_rows, max_cols, stream) };
+    Ok(())
+}
+
+/// Pre-allocate persistent device buffers for GEMV
+pub fn gpu_alloc_buffers(d_x: *mut *mut f32, d_out: *mut *mut f32, max_cols: i32, max_rows: i32, stream: CudaStream) -> Result<()> {
+    let lib = try_lib()?;
+    let func: Symbol<unsafe extern "C" fn(*mut *mut f32, *mut *mut f32, i32, i32, CudaStream)> =
+        unsafe { lib.get(b"gpu_alloc_buffers")? };
+    unsafe { func(d_x, d_out, max_cols, max_rows, stream) };
+    Ok(())
+}
+
+/// Free persistent device buffers
+pub fn gpu_free_buffers(d_x: *mut f32, d_out: *mut f32) -> Result<()> {
+    let lib = try_lib()?;
+    let func: Symbol<unsafe extern "C" fn(*mut f32, *mut f32)> =
+        unsafe { lib.get(b"gpu_free_buffers")? };
+    unsafe { func(d_x, d_out) };
+    Ok(())
+}
+
 /// Allocate device memory (raw bytes)
 pub unsafe fn gpu_alloc(bytes: usize) -> Result<*mut std::ffi::c_void> {
     let lib = try_lib()?;

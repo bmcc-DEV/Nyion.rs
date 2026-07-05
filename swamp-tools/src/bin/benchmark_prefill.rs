@@ -3,6 +3,8 @@ use clap::Parser;
 use anyhow::Result;
 use swamp_engine::Model;
 use swamp_engine::linear::forward_gemvs_ring;
+use swamp_gpu::{gpu_init, gpu_stream_create, gpu_upload_weights, gpu_gemv_q4k_prealloc, gpu_alloc_buffers, gpu_free_buffers, gpu_free_weights};
+use std::sync::OnceLock;
 
 #[derive(Parser)]
 #[command(name = "swamp-benchmark-prefill")]
@@ -26,6 +28,28 @@ fn main() -> Result<()> {
     println!("Loading model...");
     let model = Model::load(&args.model)?;
     model.print_info();
+
+    // GPU init + upload weights + persistent buffers
+    let mut _use_gpu = false;
+    let mut d_w: *mut u8 = std::ptr::null_mut();
+    let mut d_x: *mut f32 = std::ptr::null_mut();
+    let mut d_out: *mut f32 = std::ptr::null_mut();
+    let mut stream = unsafe { std::mem::zeroed() };
+    if let Ok(_) = gpu_init() {
+        if let Ok(s) = gpu_stream_create() {
+            stream = s;
+            let total_w: usize = model.layer_rings.iter().map(|r| r.ring.len()).sum();
+            let mut all_w: Vec<u8> = Vec::with_capacity(total_w);
+            for r in &model.layer_rings { all_w.extend_from_slice(&r.ring); }
+            if gpu_upload_weights(all_w.as_ptr(), &mut d_w, total_w, stream).is_ok() {
+                // Pre-allocate persistent device buffers (max dim: 5632 rows, 5632 cols)
+                unsafe { let _ = gpu_alloc_buffers(&mut d_x, &mut d_out, 5632, 5632, stream); }
+                println!("  GPU: weights uploaded ({} MB, {} layers)", total_w / (1024*1024), model.layer_rings.len());
+                _use_gpu = true;
+            }
+        }
+    }
+    if !_use_gpu { eprintln!("  GPU not available — using CPU"); }
 
     let head_dim = model.config.embed_dim / model.config.num_heads;
     swamp_engine::ops::init_rope_lut(head_dim, model.config.context_len);
@@ -78,36 +102,71 @@ fn main() -> Result<()> {
         let mut fd = vec![0.0f32; model.config.embed_dim];
         let mut pos = args.prompt_tokens;
 
+        // Pre-compute layer sizes for GPU offset calculation
+        let mut layer_sizes: Vec<usize> = Vec::with_capacity(num_layers);
+        for l in 0..num_layers {
+            let r = &model.layer_rings[l];
+            layer_sizes.push(r.ring.len());
+        }
+
         let t1 = Instant::now();
         for _step in 0..decode_steps {
             for l in 0..num_layers {
                 let ring = &model.layer_rings[l];
                 swamp_engine::ops::rmsnorm(&mut xn, &x, &attn_norms[l], 1e-5);
-                swamp_engine::linear::forward_gemvs_ring(&mut [
-                    (ring.q_slice(), &xn, &mut q, ring.q_nr, ring.q_nc, ring.q_bs),
-                    (ring.k_slice(), &xn, &mut k, ring.k_nr, ring.k_nc, ring.k_bs),
-                    (ring.v_slice(), &xn, &mut v, ring.v_nr, ring.v_nc, ring.v_bs),
-                ], n_threads);
+                if _use_gpu {
+                    let layer_off: usize = layer_sizes[..l].iter().sum();
+                    unsafe {
+                        let dw = d_w.add(layer_off);
+                        let _ = gpu_gemv_q4k_prealloc(dw, &xn, &mut q, d_x, d_out, ring.q_nr as i32, (ring.q_nc / 256) as i32, 5632, 5632, stream);
+                        let _ = gpu_gemv_q4k_prealloc(dw.add(ring.q_off), &xn, &mut k, d_x, d_out, ring.k_nr as i32, (ring.k_nc / 256) as i32, 5632, 5632, stream);
+                        let _ = gpu_gemv_q4k_prealloc(dw.add(ring.k_off), &xn, &mut v, d_x, d_out, ring.v_nr as i32, (ring.v_nc / 256) as i32, 5632, 5632, stream);
+                    }
+                } else {
+                    swamp_engine::linear::forward_gemvs_ring(&mut [
+                        (ring.q_slice(), &xn, &mut q, ring.q_nr, ring.q_nc, ring.q_bs),
+                        (ring.k_slice(), &xn, &mut k, ring.k_nr, ring.k_nc, ring.k_bs),
+                        (ring.v_slice(), &xn, &mut v, ring.v_nr, ring.v_nc, ring.v_bs),
+                    ], n_threads);
+                }
                 swamp_engine::ops::apply_rope_ufc(&mut q, &mut k, pos,
                     model.config.num_heads, model.config.num_kv_heads, head_dim, model.config.context_len);
                 kv_cache.save(l, &k, &v);
                 let seq_len = pos + 1;
                 swamp_engine::ops::attention(&mut ao, &q, &mut kv_cache, l, seq_len, pos,
                     model.config.num_heads, model.config.num_kv_heads, head_dim);
-                swamp_engine::linear::forward_gemvs_ring(&mut [
-                    (ring.o_slice(), &ao, &mut wo, ring.o_nr, ring.o_nc, ring.o_bs),
-                ], n_threads);
+                if _use_gpu {
+                    let layer_off: usize = layer_sizes[..l].iter().sum();
+                    unsafe { let _ = gpu_gemv_q4k_prealloc(d_w.add(layer_off + ring.o_off), &ao, &mut wo, d_x, d_out, ring.o_nr as i32, (ring.o_nc / 256) as i32, 5632, 5632, stream); }
+                } else {
+                    swamp_engine::linear::forward_gemvs_ring(&mut [
+                        (ring.o_slice(), &ao, &mut wo, ring.o_nr, ring.o_nc, ring.o_bs),
+                    ], n_threads);
+                }
                 swamp_engine::ops::add_in_place(&mut x, &wo);
                 swamp_engine::ops::rmsnorm(&mut xn, &x, &ffn_norms[l], 1e-5);
-                swamp_engine::linear::forward_gemvs_ring(&mut [
-                    (ring.gate_slice(), &xn, &mut fg, ring.gate_nr, ring.gate_nc, ring.gate_bs),
-                    (ring.up_slice(), &xn, &mut fu, ring.up_nr, ring.up_nc, ring.up_bs),
-                ], n_threads);
+                if _use_gpu {
+                    let layer_off: usize = layer_sizes[..l].iter().sum();
+                    unsafe {
+                        let _ = gpu_gemv_q4k_prealloc(d_w.add(layer_off + ring.gate_off), &xn, &mut fg, d_x, d_out, ring.gate_nr as i32, (ring.gate_nc / 256) as i32, 5632, 5632, stream);
+                        let _ = gpu_gemv_q4k_prealloc(d_w.add(layer_off + ring.up_off), &xn, &mut fu, d_x, d_out, ring.up_nr as i32, (ring.up_nc / 256) as i32, 5632, 5632, stream);
+                    }
+                } else {
+                    swamp_engine::linear::forward_gemvs_ring(&mut [
+                        (ring.gate_slice(), &xn, &mut fg, ring.gate_nr, ring.gate_nc, ring.gate_bs),
+                        (ring.up_slice(), &xn, &mut fu, ring.up_nr, ring.up_nc, ring.up_bs),
+                    ], n_threads);
+                }
                 swamp_engine::ops::silu(&mut fg);
                 swamp_engine::ops::mul_in_place(&mut fg, &fu);
-                swamp_engine::linear::forward_gemvs_ring(&mut [
-                    (ring.down_slice(), &fg, &mut fd, ring.down_nr, ring.down_nc, ring.down_bs),
-                ], n_threads);
+                if _use_gpu {
+                    let layer_off: usize = layer_sizes[..l].iter().sum();
+                    unsafe { let _ = gpu_gemv_q4k_prealloc(d_w.add(layer_off + ring.down_off), &fg, &mut fd, d_x, d_out, ring.down_nr as i32, (ring.down_nc / 256) as i32, 5632, 5632, stream); }
+                } else {
+                    swamp_engine::linear::forward_gemvs_ring(&mut [
+                        (ring.down_slice(), &fg, &mut fd, ring.down_nr, ring.down_nc, ring.down_bs),
+                    ], n_threads);
+                }
                 swamp_engine::ops::add_in_place(&mut x, &fd);
                 kv_cache.advance();
             }

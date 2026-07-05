@@ -930,4 +930,58 @@ void gpu_gemv_q4k(
     kernel_gemv_q4k<<<blocks, threads, 0, stream>>>(d_w, d_x, d_out, n_rows, n_blocks, 0.0f, 0.0f);
 }
 
+// Upload weights to GPU (ring buffer)
+void gpu_upload_weights(const uint8_t* h_w, uint8_t** d_w, size_t bytes, cudaStream_t stream) {
+    cudaMalloc(d_w, bytes);
+    cudaMemcpyAsync(*d_w, h_w, bytes, cudaMemcpyHostToDevice, stream);
+}
+
+void gpu_free_weights(uint8_t* d_w) {
+    cudaFree(d_w);
+}
+
+// Copy activation vector to GPU and run GEMV, copy result back
+void gpu_gemv_q4k_full(
+    const uint8_t* d_w, const float* h_x, float* h_out,
+    int n_rows, int n_blocks, cudaStream_t stream
+) {
+    size_t x_bytes = (size_t)n_blocks * 256 * sizeof(float);
+    size_t out_bytes = (size_t)n_rows * sizeof(float);
+    float *d_x, *d_out;
+    cudaMalloc(&d_x, x_bytes);
+    cudaMalloc(&d_out, out_bytes);
+    cudaMemcpyAsync(d_x, h_x, x_bytes, cudaMemcpyHostToDevice, stream);
+    int threads = 256;
+    int blocks = (n_rows + threads - 1) / threads;
+    kernel_gemv_q4k<<<blocks, threads, 0, stream>>>(d_w, d_x, d_out, n_rows, n_blocks, 0.0f, 0.0f);
+    cudaMemcpyAsync(h_out, d_out, out_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaFree(d_x);
+    cudaFree(d_out);
+}
+
+// GEMV with pre-allocated buffers (no malloc per call)
+void gpu_gemv_q4k_prealloc(
+    const uint8_t* d_w, const float* h_x, float* h_out,
+    float* d_x, float* d_out,
+    int n_rows, int n_blocks, int max_n_rows, int max_n_cols,
+    cudaStream_t stream
+) {
+    size_t x_bytes = (size_t)n_blocks * 256 * sizeof(float);
+    size_t out_bytes = (size_t)n_rows * sizeof(float);
+    cudaMemcpyAsync(d_x, h_x, x_bytes, cudaMemcpyHostToDevice, stream);
+    int threads = 256;
+    int blocks = (n_rows + threads - 1) / threads;
+    kernel_gemv_q4k<<<blocks, threads, 0, stream>>>(d_w, d_x, d_out, n_rows, n_blocks, 0.0f, 0.0f);
+    cudaMemcpyAsync(h_out, d_out, out_bytes, cudaMemcpyDeviceToHost, stream);
+}
+
+void gpu_alloc_buffers(float** d_x, float** d_out, int max_cols, int max_rows, cudaStream_t stream) {
+    cudaMalloc(d_x, (size_t)max_cols * sizeof(float));
+    cudaMalloc(d_out, (size_t)max_rows * sizeof(float));
+}
+
+void gpu_free_buffers(float* d_x, float* d_out) {
+    cudaFree(d_x);
+    cudaFree(d_out);
+}
 } // extern "C"
