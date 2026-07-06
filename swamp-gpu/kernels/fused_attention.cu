@@ -1141,19 +1141,20 @@ void gpu_swamp_launch(
     int* d_shutdown,
     cudaStream_t stream
 ) {
-    swamp_continuum<<<1, 256, 0, stream>>>(d_ring, d_w_base, d_state, d_shutdown);
+    // Lança no stream 0 (padrão) para sincronizar com cudaMemcpy síncrono
+    swamp_continuum<<<1, 256, 0, (cudaStream_t)0>>>(d_ring, d_w_base, d_state, d_shutdown);
 }
 
-// Enfileira opcode — usa tail local (CPU mantém cópia própria)
-// Chamada: host escreve opcode e incrementa tail via cudaMemcpy
+// Enfileira opcode — usa cudaMemcpy síncrono (stream 0, sem pinning)
 void gpu_swamp_enqueue(
     SwampRingBuffer* d_ring,
     int op_type, int layer_id,
     int x_off, int w_off, int out_off,
     int rows, int n_blocks,
-    unsigned int local_tail,     // CPU mantém e passa
+    unsigned int local_tail,
     cudaStream_t stream
 ) {
+    (void)stream; // não usado — operações síncronas no stream 0
     SwampOpcode op;
     memset(&op, 0, sizeof(op));
     op.op = op_type;
@@ -1164,21 +1165,19 @@ void gpu_swamp_enqueue(
     op.rows = rows;
     op.n_blocks = n_blocks;
 
-    // Escreve opcode
-    cudaMemcpyAsync(
+    // Escreve opcode (síncrono, stream 0)
+    cudaMemcpy(
         &d_ring->slots[local_tail & 1023],
         &op, sizeof(SwampOpcode),
-        cudaMemcpyHostToDevice,
-        stream
+        cudaMemcpyHostToDevice
     );
 
-    // Publica opcode (incrementa tail)
+    // Publica (incrementa tail)
     unsigned int new_tail = local_tail + 1;
-    cudaMemcpyAsync(
+    cudaMemcpy(
         (void*)(&d_ring->tail),
         &new_tail, sizeof(unsigned int),
-        cudaMemcpyHostToDevice,
-        stream
+        cudaMemcpyHostToDevice
     );
 }
 

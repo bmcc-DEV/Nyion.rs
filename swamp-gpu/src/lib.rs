@@ -254,12 +254,13 @@ pub fn gpu_swamp_enqueue(
     op_type: i32, layer_id: i32,
     x_off: i32, w_off: i32, out_off: i32,
     rows: i32, n_blocks: i32,
+    local_tail: u32,
     stream: CudaStream,
 ) -> Result<()> {
     let lib = try_lib()?;
-    let func: Symbol<unsafe extern "C" fn(*const std::ffi::c_void, i32, i32, i32, i32, i32, i32, i32, CudaStream)> =
+    let func: Symbol<unsafe extern "C" fn(*const std::ffi::c_void, i32, i32, i32, i32, i32, i32, i32, u32, CudaStream)> =
         unsafe { lib.get(b"gpu_swamp_enqueue")? };
-    unsafe { func(d_ring, op_type, layer_id, x_off, w_off, out_off, rows, n_blocks, stream) };
+    unsafe { func(d_ring, op_type, layer_id, x_off, w_off, out_off, rows, n_blocks, local_tail, stream) };
     Ok(())
 }
 
