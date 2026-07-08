@@ -242,6 +242,22 @@ pub struct ModelExecutor {
     pub output_norm: Vec<f32>,
 }
 
+impl Clone for ModelExecutor {
+    fn clone(&self) -> Self {
+        Self {
+            model: self.model.clone(),
+            thermal_coordinator: ThermalCoordinator::default(),
+            prefetcher: LscPrefetcher::default(),
+            policy: PolicyEngine::new(&self.policy.script_path().to_string(), 6)
+                .unwrap_or_else(|_| PolicyEngine::new("", 6).unwrap()),
+            token_embd: self.token_embd.clone(),
+            attn_norms: self.attn_norms.clone(),
+            ffn_norms: self.ffn_norms.clone(),
+            output_norm: self.output_norm.clone(),
+        }
+    }
+}
+
 impl ModelExecutor {
     pub fn new(model: Arc<Model>) -> Self {
         let head_dim = model.config.embed_dim / model.config.num_heads;

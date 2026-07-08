@@ -1504,6 +1504,7 @@ dependencies = [
  "swamp-gguf",
  "swamp-gpu",
  "swamp-kernels",
+ "tokio",
 ]
 
 [[package]]

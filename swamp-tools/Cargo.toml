@@ -35,3 +35,4 @@ swamp-gpu = { path = "../swamp-gpu" }
 anyhow = { workspace = true }
 clap   = { workspace = true }
 half   = { workspace = true }
+tokio  = { workspace = true }
