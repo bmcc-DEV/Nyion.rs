@@ -1139,46 +1139,65 @@ void gpu_swamp_launch(
     const uint8_t* d_w_base,
     float* d_state,
     int* d_shutdown,
-    cudaStream_t stream
+    cudaStream_t kernel_stream  // stream DEDICADO (nunca sincronizado)
 ) {
-    // Lança no stream 0 (padrão) para sincronizar com cudaMemcpy síncrono
-    swamp_continuum<<<1, 256, 0, (cudaStream_t)0>>>(d_ring, d_w_base, d_state, d_shutdown);
+    swamp_continuum<<<1, 256, 0, kernel_stream>>>(d_ring, d_w_base, d_state, d_shutdown);
+    gpu_swamp_alloc_pinned();
 }
 
-// Enfileira opcode — usa cudaMemcpy síncrono (stream 0, sem pinning)
+// Buffer pinned para opcodes (alocado uma vez, reutilizado)
+static SwampOpcode* pinned_op_buf = NULL;
+
+void gpu_swamp_alloc_pinned() {
+    cudaHostAlloc(&pinned_op_buf, sizeof(SwampOpcode), cudaHostAllocDefault);
+}
+
+void gpu_swamp_free_pinned() {
+    if (pinned_op_buf) cudaFreeHost(pinned_op_buf);
+}
+
+// Enfileira opcode via stream de dados (NÃO o stream do kernel)
 void gpu_swamp_enqueue(
     SwampRingBuffer* d_ring,
     int op_type, int layer_id,
     int x_off, int w_off, int out_off,
     int rows, int n_blocks,
     unsigned int local_tail,
-    cudaStream_t stream
+    cudaStream_t data_stream
 ) {
-    (void)stream; // não usado — operações síncronas no stream 0
-    SwampOpcode op;
-    memset(&op, 0, sizeof(op));
-    op.op = op_type;
-    op.layer_id = layer_id;
-    op.x_offset = x_off;
-    op.w_offset = w_off;
-    op.out_offset = out_off;
-    op.rows = rows;
-    op.n_blocks = n_blocks;
+    if (!pinned_op_buf) return;
 
-    // Escreve opcode (síncrono, stream 0)
-    cudaMemcpy(
+    // Preenche opcode no buffer pinned
+    pinned_op_buf->op = op_type;
+    pinned_op_buf->layer_id = layer_id;
+    pinned_op_buf->x_offset = x_off;
+    pinned_op_buf->w_offset = w_off;
+    pinned_op_buf->out_offset = out_off;
+    pinned_op_buf->rows = rows;
+    pinned_op_buf->n_blocks = n_blocks;
+
+    // Copia opcode para o ring buffer no device (via data_stream)
+    cudaMemcpyAsync(
         &d_ring->slots[local_tail & 1023],
-        &op, sizeof(SwampOpcode),
-        cudaMemcpyHostToDevice
+        pinned_op_buf, sizeof(SwampOpcode),
+        cudaMemcpyHostToDevice,
+        data_stream
     );
 
-    // Publica (incrementa tail)
+    // Publica tail (kernel vê via __threadfence_system)
     unsigned int new_tail = local_tail + 1;
-    cudaMemcpy(
+    cudaMemcpyAsync(
         (void*)(&d_ring->tail),
         &new_tail, sizeof(unsigned int),
-        cudaMemcpyHostToDevice
+        cudaMemcpyHostToDevice,
+        data_stream
     );
+}
+
+// Leitura de resultado do device para host (síncrono no data_stream)
+void gpu_swamp_readback(float* dst, float* src, size_t bytes, cudaStream_t data_stream) {
+    cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, data_stream);
+    cudaStreamSynchronize(data_stream);
 }
 
 // Sinaliza shutdown do kernel persistente

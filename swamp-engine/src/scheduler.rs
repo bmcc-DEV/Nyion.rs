@@ -241,14 +241,20 @@ unsafe impl Sync for PerLayerGpuState {}
 
 #[cfg(feature = "gpu")]
 impl PerLayerGpuState {
-    /// Run GPU attention for one layer asynchronously.
-    /// Calls `copy_kv_async` on copy stream, then `copy_q_async` + `launch_attention` + `copy_output_async` on compute stream.
+    /// Pre-upload K/V to the GPU FP16 buffer for the given position.
+    /// Must be called after `kv_cache.save()` and before `execute_attention_async()`.
+    /// Returns true if the copy was submitted successfully.
+    pub fn upload_kv_async(&mut self, h_k: &[f32], h_v: &[f32], pos: usize) -> bool {
+        self.gpu.copy_kv_async(self.d_k_buf, h_k, pos, self.n_kv_heads)
+            && self.gpu.copy_kv_async(self.d_v_buf, h_v, pos, self.n_kv_heads)
+    }
+
+    /// Run GPU attention for one layer asynchronously, using pre-uploaded KV
+    /// (uploaded via `upload_kv_async`). Does NOT copy KV — assumes resident on GPU.
     /// Returns true if GPU execution was launched successfully.
     pub fn execute_attention_async(
         &mut self,
         h_q: &[f32],
-        h_k: &[f32],
-        h_v: &[f32],
         h_out: &mut [f32],
         pos: usize,
         seq_len: usize,
@@ -257,16 +263,7 @@ impl PerLayerGpuState {
             return false;
         }
 
-        // Step 1: async KV copy on copy stream (can overlap with CPU work and compute stream)
-        let kv_ok = self.gpu.copy_kv_async(self.d_k_buf, h_k, pos, self.n_kv_heads)
-            && self.gpu.copy_kv_async(self.d_v_buf, h_v, pos, self.n_kv_heads);
-
-        if !kv_ok {
-            return false;
-        }
-
-        // Step 2: async Q copy + launch attention + async output copy on compute stream
-        // These are ordered by stream semantics (no explicit event needed)
+        // Q copy + launch attention + output copy on compute stream
         let q_ok = self.gpu.copy_q_async(h_q);
         if !q_ok { return false; }
 

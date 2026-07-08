@@ -264,6 +264,15 @@ pub fn gpu_swamp_enqueue(
     Ok(())
 }
 
+/// Read back results from device to host (sync on data stream)
+pub fn gpu_swamp_readback(dst: *mut f32, src: *mut f32, bytes: usize, stream: CudaStream) -> Result<()> {
+    let lib = try_lib()?;
+    let func: Symbol<unsafe extern "C" fn(*mut f32, *mut f32, usize, CudaStream)> =
+        unsafe { lib.get(b"gpu_swamp_readback")? };
+    unsafe { func(dst, src, bytes, stream) };
+    Ok(())
+}
+
 /// Signal shutdown to the persistent kernel
 pub fn gpu_swamp_shutdown(d_shutdown: *const i32, stream: CudaStream) -> Result<()> {
     let lib = try_lib()?;

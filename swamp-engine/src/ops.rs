@@ -98,7 +98,6 @@ pub fn attention_sparse(
     let scale = 1.0 / (head_dim as f32).sqrt();
     let n_rep = n_heads / n_kv_heads;
     let valid_end = q_pos.min(seq_len - 1);
-    let block_size = kv_cache.block_size;
 
     // Build sparse position list: last `window` + every `global_stride`-th older
     let mut positions: Vec<usize> = Vec::with_capacity(window + 128);
@@ -113,9 +112,8 @@ pub fn attention_sparse(
         positions.push(t);
     }
 
-    // Pre-heat pages
-    let end_page = valid_end / block_size;
-    kv_cache.ensure_pages_hot(0, end_page);
+    let end_page = kv_cache.page_id(valid_end);
+    kv_cache.ensure_pages_hot_f32(0, end_page);
 
     out.par_chunks_mut(head_dim)
        .enumerate()
@@ -134,8 +132,8 @@ pub fn attention_sparse(
                 // Score loop (sparse positions)
                 let mut max_score = f32::NEG_INFINITY;
                 for (idx, &t) in positions.iter().enumerate() {
-                    let pid = t / block_size;
-                    let page_start = pid * block_size;
+                    let pid = kv_cache.page_id(t);
+                    let page_start = kv_cache.page_start_for(t);
                     let k_page_base = kv_cache.k_page_ptr(layer_idx, kv_h, pid);
                     let k_ptr = unsafe { k_page_base.add((t - page_start) * head_dim) };
                     let score = unsafe { dot_product_raw(q_ptr, k_ptr, head_dim) * scale };
@@ -158,8 +156,8 @@ pub fn attention_sparse(
                     let out_ptr = out_head.as_mut_ptr();
                     std::ptr::write_bytes(out_ptr, 0, head_dim);
                     for (idx, &t) in positions.iter().enumerate() {
-                        let pid = t / block_size;
-                        let page_start = pid * block_size;
+                        let pid = kv_cache.page_id(t);
+                        let page_start = kv_cache.page_start_for(t);
                         let v_page_base = kv_cache.v_page_ptr(layer_idx, kv_h, pid);
                         let v_ptr = v_page_base.add((t - page_start) * head_dim);
                         weighted_sum_raw(out_ptr, v_ptr, scores[idx], head_dim);
@@ -183,19 +181,15 @@ pub fn attention(
     let scale = 1.0 / (head_dim as f32).sqrt();
     let n_rep = n_heads / n_kv_heads;
     let valid_end = q_pos.min(seq_len - 1);
-    let block_size = kv_cache.block_size;
 
-    // Pre-heat all pages that attention will touch
-    let end_page = valid_end / block_size;
-    kv_cache.ensure_pages_hot(0, end_page);
+    let end_page = kv_cache.page_id(valid_end);
+    kv_cache.ensure_pages_hot_f32(0, end_page);
 
     out.par_chunks_mut(head_dim)
        .enumerate()
        .for_each(|(h, out_head)| {
             let kv_h = h / n_rep;
             let q_ptr = unsafe { q.as_ptr().add(h * head_dim) };
-            let start_page = 0;
-            let end_page = valid_end / block_size;
 
             SCORES_BUF.with(|buf| {
                 let mut scores = buf.borrow_mut();
@@ -204,31 +198,35 @@ pub fn attention(
                 }
                 let scores = &mut scores[..seq_len];
 
-                // === SCORE LOOP (page by page) ===
+                // === SCORE LOOP (page by page, zone-aware) ===
                 let mut max_score = f32::NEG_INFINITY;
-                for pid in start_page..=end_page {
-                    let page_start = pid * block_size;
-                    let page_end = (page_start + block_size - 1).min(valid_end);
+                let mut t = 0;
+                while t <= valid_end {
+                    let pid = kv_cache.page_id(t);
+                    let page_start = kv_cache.page_start_for(t);
+                    let bs = kv_cache.block_size_for(t);
+                    let page_end = (page_start + bs - 1).min(valid_end);
 
                     let k_page_base = kv_cache.k_page_ptr(layer_idx, kv_h, pid);
 
                     unsafe {
-                        for t in page_start..=page_end {
+                        for tt in page_start..=page_end {
                             #[cfg(target_arch = "x86_64")]
-                            if t + 4 <= page_end {
+                            if tt + 4 <= page_end {
                                 std::arch::x86_64::_mm_prefetch(
-                                    k_page_base.add((t + 4 - page_start) * head_dim) as *const i8,
+                                    k_page_base.add((tt + 4 - page_start) * head_dim) as *const i8,
                                     std::arch::x86_64::_MM_HINT_T0,
                                 );
                             }
-                            let k_ptr = k_page_base.add((t - page_start) * head_dim);
+                            let k_ptr = k_page_base.add((tt - page_start) * head_dim);
                             let score = dot_product_raw(q_ptr, k_ptr, head_dim) * scale;
-                            scores[t] = score;
+                            scores[tt] = score;
                             if score > max_score {
                                 max_score = score;
                             }
                         }
                     }
+                    t = page_end + 1;
                 }
 
                 // Mascara posicoes futuras (causal)
@@ -248,31 +246,158 @@ pub fn attention(
                     scores[t] *= inv_sum;
                 }
 
-                // === WEIGHTED SUM LOOP (page by page) ===
+                // === WEIGHTED SUM LOOP (page by page, zone-aware) ===
                 unsafe {
                     let out_ptr = out_head.as_mut_ptr();
                     std::ptr::write_bytes(out_ptr, 0, head_dim);
-                    for pid in start_page..=end_page {
-                        let page_start = pid * block_size;
-                        let page_end = (page_start + block_size - 1).min(valid_end);
+                    let mut t = 0;
+                    while t <= valid_end {
+                        let pid = kv_cache.page_id(t);
+                        let page_start = kv_cache.page_start_for(t);
+                        let bs = kv_cache.block_size_for(t);
+                        let page_end = (page_start + bs - 1).min(valid_end);
 
                         let v_page_base = kv_cache.v_page_ptr(layer_idx, kv_h, pid);
 
-                        for t in page_start..=page_end {
+                        for tt in page_start..=page_end {
                             #[cfg(target_arch = "x86_64")]
-                            if t + 4 <= page_end {
+                            if tt + 4 <= page_end {
                                 std::arch::x86_64::_mm_prefetch(
-                                    v_page_base.add((t + 4 - page_start) * head_dim) as *const i8,
+                                    v_page_base.add((tt + 4 - page_start) * head_dim) as *const i8,
                                     std::arch::x86_64::_MM_HINT_T0,
                                 );
                             }
-                            let v_ptr = v_page_base.add((t - page_start) * head_dim);
-                            weighted_sum_raw(out_ptr, v_ptr, scores[t], head_dim);
+                            let v_ptr = v_page_base.add((tt - page_start) * head_dim);
+                            weighted_sum_raw(out_ptr, v_ptr, scores[tt], head_dim);
                         }
+                        t = page_end + 1;
                     }
                 }
             });
         });
+}
+
+/// Full attention that also records per-position softmax weights for
+/// entropy-based eviction. `importance` is accumulated across all heads:
+/// positions with high cumulative weight have low entropy (heavy hitters).
+pub fn attention_tracked(
+    out: &mut [f32],
+    q: &[f32],
+    kv_cache: &mut crate::cache::PagedKVCache,
+    layer_idx: usize,
+    seq_len: usize,
+    q_pos: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    importance: &mut [f64],
+) {
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let n_rep = n_heads / n_kv_heads;
+    let valid_end = q_pos.min(seq_len - 1);
+
+    let end_page = kv_cache.page_id(valid_end);
+    kv_cache.ensure_pages_hot_f32(0, end_page);
+
+    // Use an independent Vec inside Mutex to avoid &mut [f64] Sync issues in rayón
+    let acc = std::sync::Mutex::new(importance.to_vec());
+
+    out.par_chunks_mut(head_dim)
+       .enumerate()
+       .for_each(|(h, out_head)| {
+            let kv_h = h / n_rep;
+            let q_ptr = unsafe { q.as_ptr().add(h * head_dim) };
+
+            SCORES_BUF.with(|buf| {
+                let mut scores = buf.borrow_mut();
+                if scores.len() < seq_len {
+                    scores.resize(seq_len, 0.0);
+                }
+                let scores = &mut scores[..seq_len];
+
+                // === SCORE LOOP (same as attention) ===
+                let mut max_score = f32::NEG_INFINITY;
+                let mut t = 0;
+                while t <= valid_end {
+                    let pid = kv_cache.page_id(t);
+                    let page_start = kv_cache.page_start_for(t);
+                    let bs = kv_cache.block_size_for(t);
+                    let page_end = (page_start + bs - 1).min(valid_end);
+                    let k_page_base = kv_cache.k_page_ptr(layer_idx, kv_h, pid);
+                    unsafe {
+                        for tt in page_start..=page_end {
+                            #[cfg(target_arch = "x86_64")]
+                            if tt + 4 <= page_end {
+                                std::arch::x86_64::_mm_prefetch(
+                                    k_page_base.add((tt + 4 - page_start) * head_dim) as *const i8,
+                                    std::arch::x86_64::_MM_HINT_T0,
+                                );
+                            }
+                            let k_ptr = k_page_base.add((tt - page_start) * head_dim);
+                            let score = dot_product_raw(q_ptr, k_ptr, head_dim) * scale;
+                            scores[tt] = score;
+                            if score > max_score { max_score = score; }
+                        }
+                    }
+                    t = page_end + 1;
+                }
+
+                // Mask future positions
+                for t in (valid_end + 1)..seq_len {
+                    scores[t] = f32::NEG_INFINITY;
+                }
+
+                // Softmax
+                let mut sum_exp = 0.0f32;
+                for t in 0..seq_len {
+                    let exp_score = (scores[t] - max_score).exp();
+                    scores[t] = exp_score;
+                    sum_exp += exp_score;
+                }
+                let inv_sum = 1.0 / sum_exp;
+                for t in 0..seq_len {
+                    scores[t] *= inv_sum;
+                }
+
+                // Accumulate importance across heads
+                {
+                    let mut guard = acc.lock().unwrap();
+                    for t in 0..seq_len {
+                        guard[t] += scores[t] as f64;
+                    }
+                }
+
+                // === WEIGHTED SUM (same as attention) ===
+                unsafe {
+                    let out_ptr = out_head.as_mut_ptr();
+                    std::ptr::write_bytes(out_ptr, 0, head_dim);
+                    let mut t = 0;
+                    while t <= valid_end {
+                        let pid = kv_cache.page_id(t);
+                        let page_start = kv_cache.page_start_for(t);
+                        let bs = kv_cache.block_size_for(t);
+                        let page_end = (page_start + bs - 1).min(valid_end);
+                        let v_page_base = kv_cache.v_page_ptr(layer_idx, kv_h, pid);
+                        for tt in page_start..=page_end {
+                            #[cfg(target_arch = "x86_64")]
+                            if tt + 4 <= page_end {
+                                std::arch::x86_64::_mm_prefetch(
+                                    v_page_base.add((tt + 4 - page_start) * head_dim) as *const i8,
+                                    std::arch::x86_64::_MM_HINT_T0,
+                                );
+                            }
+                            let v_ptr = v_page_base.add((tt - page_start) * head_dim);
+                            weighted_sum_raw(out_ptr, v_ptr, scores[tt], head_dim);
+                        }
+                        t = page_end + 1;
+                    }
+                }
+            });
+        });
+
+    // Copy accumulated weights back to caller
+    let final_acc = acc.into_inner().unwrap();
+    importance.copy_from_slice(&final_acc);
 }
 
 pub fn rmsnorm(out: &mut [f32], x: &[f32], weight: &[f32], eps: f32) {
@@ -309,6 +434,112 @@ pub fn add_in_place(a: &mut [f32], b: &[f32]) {
     }
 }
 
+/// Fugu hierarchical sparse attention:
+///   - sliding window (last `window` tokens)
+///   - sentinel tokens (every `sentinel_stride`-th older token)
+///   - DSPark-selected cold blocks (positions from LSH match)
+///
+/// Combines all three into a single sparse position set, then computes
+/// attention (score + softmax + weighted sum) via the FP32 dequant path.
+/// Best for seq_len > sparse_attention_threshold where full O(n²) is infeasible.
+pub fn attention_fugu(
+    out: &mut [f32],
+    q: &[f32],
+    kv_cache: &mut crate::cache::PagedKVCache,
+    layer_idx: usize,
+    seq_len: usize,
+    q_pos: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    window: usize,
+    sentinel_stride: usize,
+    dspark_positions: &[usize],
+) {
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let n_rep = n_heads / n_kv_heads;
+    let valid_end = q_pos.min(seq_len - 1);
+
+    // 1. Build position set
+    let window_start = if valid_end > window { valid_end - window + 1 } else { 0 };
+    let max_extra = window + 128 + dspark_positions.len();
+    let mut positions: Vec<usize> = Vec::with_capacity(max_extra);
+
+    // Sentinel tokens (every sentinel_stride-th from early context)
+    let sentinel_count = window_start / sentinel_stride;
+    for gi in 0..sentinel_count.min(128) {
+        positions.push(sentinel_stride * gi);
+    }
+
+    // Window tokens (most recent positions)
+    for t in window_start..=valid_end {
+        positions.push(t);
+    }
+
+    // DSPark-selected cold block positions (dedup against existing)
+    for &dp in dspark_positions {
+        if dp <= valid_end && !positions.contains(&dp) {
+            positions.push(dp);
+        }
+    }
+
+    // 2. Ensure all needed pages are hot + dequantized
+    let end_page = kv_cache.page_id(valid_end);
+    kv_cache.ensure_pages_hot_f32(0, end_page);
+
+    // 3. Parallel attention over sparse positions
+    let k = positions.len();
+    out.par_chunks_mut(head_dim)
+       .enumerate()
+       .for_each(|(h, out_head)| {
+            let kv_h = h / n_rep;
+            let q_ptr = unsafe { q.as_ptr().add(h * head_dim) };
+
+            SCORES_BUF.with(|buf| {
+                let mut buf_ref = buf.borrow_mut();
+                if buf_ref.len() < k {
+                    buf_ref.resize(k, 0.0);
+                }
+                let scores = &mut buf_ref[..k];
+
+                // Score loop
+                let mut max_score = f32::NEG_INFINITY;
+                for (idx, &t) in positions.iter().enumerate() {
+                    let pid = kv_cache.page_id(t);
+                    let page_start = kv_cache.page_start_for(t);
+                    let k_page_base = kv_cache.k_page_ptr(layer_idx, kv_h, pid);
+                    let k_ptr = unsafe { k_page_base.add((t - page_start) * head_dim) };
+                    let score = unsafe { dot_product_raw(q_ptr, k_ptr, head_dim) * scale };
+                    scores[idx] = score;
+                    if score > max_score { max_score = score; }
+                }
+
+                // Softmax over sparse set
+                let mut sum_exp = 0.0f32;
+                for s in scores.iter_mut() {
+                    let e = (*s - max_score).exp();
+                    *s = e;
+                    sum_exp += e;
+                }
+                let inv_sum = 1.0 / sum_exp;
+                for s in scores.iter_mut() { *s *= inv_sum; }
+
+                // Weighted sum from sparse positions
+                unsafe {
+                    let out_ptr = out_head.as_mut_ptr();
+                    std::ptr::write_bytes(out_ptr, 0, head_dim);
+                    for (idx, &t) in positions.iter().enumerate() {
+                        let pid = kv_cache.page_id(t);
+                        let page_start = kv_cache.page_start_for(t);
+                        let v_page_base = kv_cache.v_page_ptr(layer_idx, kv_h, pid);
+                        let v_ptr = v_page_base.add((t - page_start) * head_dim);
+                        weighted_sum_raw(out_ptr, v_ptr, scores[idx], head_dim);
+                    }
+                }
+            });
+        });
+}
+
 /// GPU-accelerated attention (falls back to CPU if GPU unavailable)
 #[cfg(feature = "gpu")]
 pub fn gpu_attention_forward(
@@ -333,9 +564,10 @@ pub fn gpu_attention_forward(
     // Copy K and V from page cache into contiguous buffers
     for kv_h in 0..n_kv_heads {
         for t in 0..seq_len {
-            let src_k = kv_cache.k_page_ptr(layer_idx, kv_h, t / kv_cache.block_size);
-            let src_v = kv_cache.v_page_ptr(layer_idx, kv_h, t / kv_cache.block_size);
-            let slot = t % kv_cache.block_size;
+            let pid = kv_cache.page_id(t);
+            let src_k = kv_cache.k_page_ptr(layer_idx, kv_h, pid);
+            let src_v = kv_cache.v_page_ptr(layer_idx, kv_h, pid);
+            let slot = kv_cache.slot_in_page(t);
             unsafe {
                 let dst_off = (kv_h * seq_len + t) * head_dim;
                 std::ptr::copy_nonoverlapping(
@@ -379,7 +611,6 @@ pub fn attention_sparse_q4(
     let scale = 1.0 / (head_dim as f32).sqrt();
     let n_rep = n_heads / n_kv_heads;
     let valid_end = q_pos.min(seq_len - 1);
-    let block_size = kv_cache.block_size;
 
     // Build sparse positions
     let mut positions: Vec<usize> = Vec::with_capacity(window + 128);
@@ -403,8 +634,8 @@ pub fn attention_sparse_q4(
         let mut scores = vec![0.0f32; k];
         let mut max_score = f32::NEG_INFINITY;
         for (idx, &t) in positions.iter().enumerate() {
-            let pid = t / block_size;
-            let slot = t % block_size;
+            let pid = kv_cache.page_id(t);
+            let slot = kv_cache.slot_in_page(t);
             let mut dot_acc = unsafe { _mm512_setzero_ps() };
 
             for blk in 0..blocks_per_head {
@@ -455,8 +686,8 @@ pub fn attention_sparse_q4(
         // Weighted sum from 4-bit V (AVX-512 vectorized)
         unsafe { std::ptr::write_bytes(out_head.as_mut_ptr(), 0, head_dim); }
         for (idx, &t) in positions.iter().enumerate() {
-            let pid = t / block_size;
-            let slot = t % block_size;
+            let pid = kv_cache.page_id(t);
+            let slot = kv_cache.slot_in_page(t);
             let w = scores[idx];
             if w < 1e-8 { continue; }
             let w_ps = unsafe { _mm512_set1_ps(w) };

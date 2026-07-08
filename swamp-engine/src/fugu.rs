@@ -19,6 +19,12 @@ pub enum AttentionStrategy {
         window: usize,
         num_random: usize,
     },
+    /// Atenção hierárquica Fugu: janela + sentinel tokens + DSPark cold blocks
+    SparseWithDSPark {
+        window: usize,
+        sentinel_stride: usize,
+        num_dspark: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +69,7 @@ pub struct SystemSnapshot {
     pub is_prefill: bool,
     pub coherence: f64,            // thermal coherence (c_epsilon)
     pub dspark_accept_rate: f64,   // 0.0–1.0 taxa de aceitação recente
+    pub predictive_throttle: bool, // Idea #2: true se throttling é iminente
 }
 
 // =========================================================================
@@ -119,15 +126,40 @@ impl FuguOrchestrator {
 
     fn decide_attention(&self, state: &SystemSnapshot) -> AttentionStrategy {
         if state.is_prefill {
-            // Prefill always needs full attention for correctness
             return AttentionStrategy::Full;
         }
 
-        if state.seq_len > self.sparse_attention_threshold {
+        // Thermal-aware threshold: predictive throttle → sparse earlier to cut power
+        let effective_threshold = if state.predictive_throttle {
+            self.sparse_attention_threshold.saturating_sub(256)
+        } else {
+            self.sparse_attention_threshold
+        };
+
+        if state.seq_len > effective_threshold {
             self.n_sparse_attention.fetch_add(1, Ordering::Relaxed);
-            AttentionStrategy::Sparse {
-                window: self.sparse_window,
-                num_random: self.sparse_random_samples,
+            // Tighter window under throttle to reduce compute
+            let window = if state.predictive_throttle {
+                self.sparse_window / 2
+            } else {
+                self.sparse_window
+            };
+            let dspark_blocks = if state.dspark_accept_rate > 0.0 && state.seq_len > 2048 {
+                16
+            } else {
+                0
+            };
+            if dspark_blocks > 0 {
+                AttentionStrategy::SparseWithDSPark {
+                    window,
+                    sentinel_stride: 64,
+                    num_dspark: dspark_blocks,
+                }
+            } else {
+                AttentionStrategy::Sparse {
+                    window,
+                    num_random: self.sparse_random_samples,
+                }
             }
         } else {
             self.n_full_attention.fetch_add(1, Ordering::Relaxed);
@@ -226,6 +258,7 @@ mod tests {
             is_prefill: false,
             coherence: 1.0,
             dspark_accept_rate: 0.5,
+            predictive_throttle: false,
         };
         let strat = fugu.decide(&state);
         assert_eq!(strat.attention, AttentionStrategy::Full);
@@ -242,6 +275,7 @@ mod tests {
             is_prefill: false,
             coherence: 1.0,
             dspark_accept_rate: 0.5,
+            predictive_throttle: false,
         };
         let strat = fugu.decide(&state);
         assert!(matches!(strat.attention, AttentionStrategy::Sparse { .. }));
@@ -262,6 +296,7 @@ mod tests {
             is_prefill: false,
             coherence: 1.0,
             dspark_accept_rate: 0.05,
+            predictive_throttle: false,
         };
         let strat = fugu.decide(&state);
         assert_eq!(strat.speculation, SpeculationStrategy::Disabled);
@@ -281,6 +316,7 @@ mod tests {
             is_prefill: false,
             coherence: 1.0,
             dspark_accept_rate: 0.9,
+            predictive_throttle: false,
         };
         let strat = fugu.decide(&state);
         assert_eq!(strat.speculation, SpeculationStrategy::Enabled(2));

@@ -91,10 +91,40 @@ fn build_layer_ring(gguf: &GgufFile, layer: usize) -> Result<RingView> {
     })
 }
 
+/// A group of consecutive layers that share identical weight tensors (all 7).
+/// Layers within a group can be processed with a single weight load per tensor.
+pub type LayerGroup = Vec<usize>;
+
+/// Detect which consecutive layers share fully identical weight tensors
+/// by comparing raw ring bytes of each of the 7 tensor types.
+fn detect_weight_groups(layer_rings: &[RingView], num_layers: usize) -> Vec<LayerGroup> {
+    if num_layers == 0 {
+        return Vec::new();
+    }
+    let mut groups: Vec<LayerGroup> = Vec::new();
+    let mut current: LayerGroup = vec![0];
+
+    for l in 1..num_layers {
+        let prev = &layer_rings[l - 1];
+        let cur = &layer_rings[l];
+        if prev.ring.len() == cur.ring.len() && prev.ring == cur.ring {
+            current.push(l);
+        } else {
+            groups.push(current);
+            current = vec![l];
+        }
+    }
+    groups.push(current);
+    groups
+}
+
 pub struct Model {
     pub gguf: GgufFile,
     pub config: ModelConfig,
     pub layer_rings: Vec<RingView>,
+    /// Groups of consecutive layers that share identical weight tensors.
+    /// Each group lists the layer indices in order; size=1 means no sharing.
+    pub shared_groups: Vec<LayerGroup>,
 }
 
 impl RingView {
@@ -182,7 +212,14 @@ impl Model {
 
     println!("  Rings built: {} layers ({} MB)", layer_rings.len(), layer_rings.iter().map(|r| r.ring.len()).sum::<usize>() / (1024*1024));
 
-        Ok(Self { gguf, config, layer_rings })
+    // Detect cross-layer weight sharing
+    let shared_groups = detect_weight_groups(&layer_rings, num_layers);
+    let shared_layers: usize = shared_groups.iter().filter(|g| g.len() > 1).map(|g| g.len()).sum();
+    if shared_layers > 0 {
+        println!("  Weight sharing: {} layers in {} groups", shared_layers, shared_groups.iter().filter(|g| g.len() > 1).count());
+    }
+
+        Ok(Self { gguf, config, layer_rings, shared_groups })
     }
 
     pub fn print_info(&self) {

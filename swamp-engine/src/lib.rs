@@ -14,7 +14,18 @@ pub mod tokenizer;
 pub mod chat_template;
 pub mod sampler;
 pub mod thermal;
+pub mod vnpu;
 pub mod policy;
+pub mod dspark;
+pub mod fugu;
+pub mod timewarp;
+pub mod virtual_experts;
+pub mod aimd;
+pub mod staging;
+pub mod power_arbiter;
+pub mod model_registry;
+pub mod model_swapper;
+pub mod pipeline;
 
 pub use cache::PagedKVCache;
 pub use executor::{ModelExecutor, InferenceRequest};
