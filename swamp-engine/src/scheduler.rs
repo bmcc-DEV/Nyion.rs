@@ -232,6 +232,21 @@ pub struct PerLayerGpuState {
     pub d_v_buf: *mut std::ffi::c_void,
     pub max_seq_len: usize,
     pub n_kv_heads: usize,
+    // GPU GEMV device weight pointers (uploaded once per layer group)
+    pub d_q_weight: *mut u8,
+    pub d_k_weight: *mut u8,
+    pub d_v_weight: *mut u8,
+    pub d_o_weight: *mut u8,
+    pub d_gate_weight: *mut u8,
+    pub d_up_weight: *mut u8,
+    pub d_down_weight: *mut u8,
+    // Pre-allocated GEMV input/output buffers
+    pub d_gemv_x: *mut f32,
+    pub d_gemv_out: *mut f32,
+    pub max_gemv_cols: i32,
+    pub max_gemv_rows: i32,
+    // Estimated VRAM usage tracking
+    pub total_vram_mb: f32,
 }
 
 #[cfg(feature = "gpu")]
@@ -286,6 +301,35 @@ impl PerLayerGpuState {
     pub fn sync(&self) -> bool {
         self.gpu.sync_compute()
     }
+
+    /// Upload ring weight tensor to GPU VRAM (one-time).
+    /// `h_w` = host pointer (mmap), `bytes` = size.
+    /// Stores device pointer in `d_dst` field.
+    pub fn upload_weight(h_w: *const u8, bytes: usize, stream: swamp_gpu::CudaStream) -> Option<*mut u8> {
+        let mut d_w: *mut u8 = std::ptr::null_mut();
+        swamp_gpu::gpu_upload_weights(h_w, &mut d_w as *mut *mut u8, bytes, stream).ok()?;
+        Some(d_w)
+    }
+
+    /// Run Q4_K GEMV on GPU using pre-allocated buffers (no malloc per call).
+    /// h_x → d_gemv_x (async copy), kernel, d_gemv_out → h_out (async copy).
+    pub fn execute_gemv_async(
+        &self,
+        d_w: *const u8,
+        h_x: &[f32],
+        h_out: &mut [f32],
+        n_rows: i32,
+        n_blocks: i32,
+    ) -> bool {
+        if d_w.is_null() { return false; }
+        swamp_gpu::gpu_gemv_q4k_prealloc(
+            d_w, h_x, h_out,
+            self.d_gemv_x, self.d_gemv_out,
+            n_rows, n_blocks,
+            self.max_gemv_rows, self.max_gemv_cols,
+            self.gpu.compute_stream,
+        ).is_ok()
+    }
 }
 
 #[cfg(feature = "gpu")]
@@ -295,6 +339,15 @@ impl Drop for PerLayerGpuState {
         let _ = self.gpu.sync_copy();
         swamp_gpu::gpu_free(self.d_k_buf).ok();
         swamp_gpu::gpu_free(self.d_v_buf).ok();
+        swamp_gpu::gpu_free(self.d_gemv_x as *mut _).ok();
+        swamp_gpu::gpu_free(self.d_gemv_out as *mut _).ok();
+        if !self.d_q_weight.is_null() { swamp_gpu::gpu_free_weights(self.d_q_weight).ok(); }
+        if !self.d_k_weight.is_null() { swamp_gpu::gpu_free_weights(self.d_k_weight).ok(); }
+        if !self.d_v_weight.is_null() { swamp_gpu::gpu_free_weights(self.d_v_weight).ok(); }
+        if !self.d_o_weight.is_null() { swamp_gpu::gpu_free_weights(self.d_o_weight).ok(); }
+        if !self.d_gate_weight.is_null() { swamp_gpu::gpu_free_weights(self.d_gate_weight).ok(); }
+        if !self.d_up_weight.is_null() { swamp_gpu::gpu_free_weights(self.d_up_weight).ok(); }
+        if !self.d_down_weight.is_null() { swamp_gpu::gpu_free_weights(self.d_down_weight).ok(); }
     }
 }
 

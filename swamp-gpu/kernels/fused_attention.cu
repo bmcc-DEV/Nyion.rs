@@ -1141,7 +1141,10 @@ void gpu_swamp_launch(
     int* d_shutdown,
     cudaStream_t kernel_stream  // stream DEDICADO (nunca sincronizado)
 ) {
-    swamp_continuum<<<1, 256, 0, kernel_stream>>>(d_ring, d_w_base, d_state, d_shutdown);
+    int sm_count;
+    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0);
+    if (sm_count < 1) sm_count = 1;
+    swamp_continuum<<<sm_count, 256, 0, kernel_stream>>>(d_ring, d_w_base, d_state, d_shutdown);
     gpu_swamp_alloc_pinned();
 }
 

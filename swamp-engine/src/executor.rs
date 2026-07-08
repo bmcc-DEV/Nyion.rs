@@ -416,12 +416,40 @@ impl ModelExecutor {
                     }
                     None => (None, None, None),
                 };
-                gpu.map(|gpu| crate::scheduler::PerLayerGpuState {
-                    gpu: Box::new(gpu),
-                    d_k_buf: d_k.unwrap_or(std::ptr::null_mut()),
-                    d_v_buf: d_v.unwrap_or(std::ptr::null_mut()),
-                    max_seq_len: max_seq,
-                    n_kv_heads: num_kv_heads,
+                gpu.map(|gpu| {
+                    use crate::scheduler::PerLayerGpuState;
+                    let d_gemv_x: *mut f32 = unsafe { swamp_gpu::gpu_alloc((ffn_dim.max(embed_dim) * 4)).ok() } as *mut f32;
+                    let d_gemv_out: *mut f32 = unsafe { swamp_gpu::gpu_alloc((ffn_dim.max(embed_dim) * 4)).ok() } as *mut f32;
+                    let stream = gpu.compute_stream;
+                    // Helper: upload a tensor's raw data to VRAM given its name
+                    let upload_tensor = |name: &str| -> *mut u8 {
+                        let (off, len) = match model.gguf.tensor_raw_offset_len(name) {
+                            Some(v) => v,
+                            None => return std::ptr::null_mut(),
+                        };
+                        let (mp, _) = model.gguf.mmap_ptr_and_len();
+                        let h_ptr = unsafe { mp.add(off) as *const u8 };
+                        PerLayerGpuState::upload_weight(h_ptr, len, stream).unwrap_or(std::ptr::null_mut())
+                    };
+                    PerLayerGpuState {
+                        gpu: Box::new(gpu),
+                        d_k_buf: d_k.unwrap_or(std::ptr::null_mut()),
+                        d_v_buf: d_v.unwrap_or(std::ptr::null_mut()),
+                        max_seq_len: max_seq,
+                        n_kv_heads: num_kv_heads,
+                        d_q_weight: upload_tensor("blk.0.attn_q.weight"),
+                        d_k_weight: upload_tensor("blk.0.attn_k.weight"),
+                        d_v_weight: upload_tensor("blk.0.attn_v.weight"),
+                        d_o_weight: upload_tensor("blk.0.attn_output.weight"),
+                        d_gate_weight: upload_tensor("blk.0.ffn_gate.weight"),
+                        d_up_weight: upload_tensor("blk.0.ffn_up.weight"),
+                        d_down_weight: upload_tensor("blk.0.ffn_down.weight"),
+                        d_gemv_x,
+                        d_gemv_out,
+                        max_gemv_cols: embed_dim.max(ffn_dim) as i32,
+                        max_gemv_rows: embed_dim.max(ffn_dim).max(num_heads * head_dim) as i32,
+                        total_vram_mb: 0.0,
+                    }
                 })
             };
 
