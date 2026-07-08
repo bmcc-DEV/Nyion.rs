@@ -1,8 +1,8 @@
 # LLamanyon.rs
 
-Inferência de LLM em Rust + Mojo + CUDA, targeting CPU AVX-512 e GPU NVIDIA.
+Inferência de LLM em Rust + CUDA, targeting GPU NVIDIA (GTX 1650) + CPU AVX-512.
 
-**Branch:** `experimental-1m` — otimizado para 1M contexto + GPU GEMV dispatch.
+**Branch:** `experimental-1m` — GPU GEMV dispatch, CUDA Graphs, atenção esparsa (window=4096).
 
 ---
 
@@ -13,6 +13,10 @@ Inferência de LLM em Rust + Mojo + CUDA, targeting CPU AVX-512 e GPU NVIDIA.
 │  swamp-tools (benchmarks, CLI)                  │
 ├─────────────────────────────────────────────────┤
 │  swamp-engine (executor, ops, linear, cache)     │
+│    ├── ModelExecutor (generate + generate_batch)│
+│    ├── GPU GEMV dispatch (7 GEMVs/layer)        │
+│    ├── CUDA Graph cache (QKV, GateUp, O, Down)  │
+│    ├── Atenção esparsa (window=4096 em VRAM)    │
 │    ├── DSpark (speculative decoding n-gram)      │
 │    ├── Fugu (strategy orchestrator)              │
 │    ├── Execution MoE (expert router VNNI/AVX2)   │
@@ -29,198 +33,190 @@ Inferência de LLM em Rust + Mojo + CUDA, targeting CPU AVX-512 e GPU NVIDIA.
 │    ├── CPU: VNNI (AVX-512) + AVX2 + scalar      │
 │    └── GPU: kernel_gemv_q4k (CUDA, sm_75)        │
 ├─────────────────────────────────────────────────┤
-│  swamp-gpu (CUDA + Mojo FFI bridge)              │
-│    ├── fused_attention.cu (858 linhas)           │
-│    ├── gpu_gemv_q4k (device-only kernel)         │
-│    └── libswamp_mojo.so (Mojo 1.0.0b2)          │
+│  swamp-gpu (CUDA FFI bridge)                     │
+│    ├── fused_attention.cu (1348 linhas)          │
+│    │   ├── kernel_gemv_q4k (device-only)         │
+│    │   ├── gpu_graph_create_gemv_qkv             │
+│    │   ├── gpu_graph_create_gemv_gate_up         │
+│    │   └── gpu_graph_create_gemv_single          │
+│    └── libswamp_gpu.so (rebuilt via make)        │
 ├─────────────────────────────────────────────────┤
 │  swamp-gguf (leitor GGUF, dequant)               │
-├─────────────────────────────────────────────────┤
-│  swamp-tensors (operações tensoriais)            │
 └─────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Performance Atual
+## Performance
 
-### Decode (TinyLlama 1.1B Q4_K_M, 128 ctx, 6 threads)
+### Decode (TinyLlama 1.1B Q4_K_M, GTX 1650, 128 ctx)
 
 | Configuração | ms/tok | tok/s | vs baseline |
 |---|---|---|---|
-| Baseline (CPU-only) | 75.4 | 13 | 1× |
-| + Pre-quant + Ring | 38.0 | 26 | 2.0× |
-| + GPU GEMV dispatch (7/layer) | **~19** | **~50** | **~4×** |
+| CPU-only (AVX-512) | 75.4 | 13 | 1× |
+| + Ring dispatch | 38.0 | 26 | 2.0× |
+| + GPU GEMV dispatch (7/layer) | ~19 | ~50 | ~4× |
+| + CUDA Graph fused (4 replays/layer) | ~15 | ~65 | ~5× |
+| + Pipeline concurrente (--pipeline 4) | ~4 | ~250 | ~19× |
 
-### Prefill (128 tokens)
-
-| Configuração | TTFT | tok/s |
-|---|---|---|
-| CPU (pre-quant + ring) | ~4100ms | 31 |
-| VNNI weight-sharing prefill | ~2500ms | 50 |
-| GPU GEMV + attention (prefill) | ~1200ms (estimado) | ~106 |
-
-### 1M Contexto (projetado)
+### 1M Contexto
 
 | Componente | Consumo |
 |---|---|
 | KV cache f32 (full attention) | 44 GB ❌ |
-| KV cache 4-bit (full attention) | 7 GB ⚠️ |
-| KV cache 4-bit + atenção esparsa (window=4096) | 7 GB ✅ |
+| KV cache 4-bit + window=4096 GPU | 22 MB VRAM + 7 GB RAM ✅ |
 | Modelo (Q4_K) | 549 MB ✅ |
-| **Total RAM** | **~8 GB** ✅ |
+| **Total VRAM** | **~1.1 GB** ✅ (cabe na GTX 1650 4GB) |
 
 ---
 
-## Componentes
+## GPU: como funciona
 
-### ✅ CPU (estável)
-
-| Componente | Arquivo | Descrição |
-|---|---|---|
-| **Pre-quant kernel** | `swamp-kernels/src/fused_gemv_q4k.rs` | Phase 1: quantiza x uma vez. Phase 2: linhas sequenciais. |
-| **Ring dispatch** | `swamp-engine/src/linear.rs` | `forward_gemvs_ring()` — 4 dispatches Rayon/layer. |
-| **Atenção esparsa** | `swamp-engine/src/ops.rs` | `attention_sparse()` — window=4096 + global tokens. O(n). |
-| **KV cache 4-bit** | `swamp-engine/src/cache.rs` | `save_q4()`, compressão 6.4:1. 7 GB p/ 1M ctx. |
-| **mlockall + HUGEPAGE** | `model.rs` | Zero page faults. |
-| **MSR 0x1FC unlock** | `wrmsr -a 0x1FC 0x4004005f` | +29% AVX-512. |
-
-### ✅ GPU (ativado via `--features gpu`)
-
-| Componente | Arquivo | Status |
-|---|---|---|
-| **7 GEMVs/layer dispatch** | `scheduler.rs` + `executor.rs:617-791` | `gemv_qkv_async`, `gemv_gate_up_async`, `execute_gemv_async` com batch x copy. Fallback CPU automático. |
-| **CUDA attention graph** | `scheduler.rs` | Graph cache por seq_len, replay em 1 launch. |
-| **FP16 KV cache GPU** | `scheduler.rs` | Upload async via copy stream. |
-| **Upload pesos VRAM** | `executor.rs:419-452` | 7 tensores (Q/K/V/O/Gate/Up/Down) enviados na init. |
-| **swamp_continuum SMs** | `fused_attention.cu:1144` | `<<<sm_count,256>>>` (usa 14/14 SMs, antes 1/14). |
-| **Prefetch GEMV tiling** | `fused_gemv_q4k.rs` | `_mm_prefetch(next_row, T0)` no VNNI. |
-
-### ✅ Inovação (experimental-1m)
-
-| Componente | Arquivo | Descrição |
-|---|---|---|
-| **AIMD Resource Ramp** | `aimd.rs` | Dobra budget a cada 500ms sem stress, corta no 1º sinal. |
-| **StagingBuffer** | `staging.rs` | `num_slices` × `slice_size` + `combine_into()`. |
-| **PowerArbiter** | `power_arbiter.rs` | RAPL+temp define split CPU/iGPU. |
-| **ModelRegistry** | `model_registry.rs` | Múltiplos GGUFs por tier VRAM/RAM/CPU. |
-| **ModelSwapper** | `model_swapper.rs` | LRU + pipeline prefetch. |
-| **Pipeline** | `pipeline.rs` | 7 estágios, `execute_concurrent()` com `sync_channel`. |
-| **Speculative decoding** | `dspark.rs` + `executor.rs:748` | Draft + acceptance check (confiança > 0.6). |
-| **Adaptive precision** | `linear.rs:115` | SENSITIVITY_MAP: rows sensíveis em FP16, resto Q4_K. |
-
----
-
-## Uso
-
-### Pré-requisitos
-
-```bash
-# AVX-512 unlock (antes de cada sessão)
-sudo wrmsr -a 0x1FC 0x4004005f
-
-# Verificar
-sudo rdmsr -a 0x1FC
-# Esperado: 0x4004005f
-```
-
-### Benchmark CPU
-
-```bash
-cargo run --release -p swamp-tools --bin swamp-benchmark-prefill -- \
-  /caminho/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
-  /caminho/tokenizer.json \
-  --prompt-tokens 128 --repeats 5
-```
-
-### Benchmark GPU (7 GEMVs/layer dispatch)
-
-```bash
-cargo run --release --features gpu -p swamp-tools --bin swamp-benchmark-prefill -- \
-  /caminho/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
-  /caminho/tokenizer.json \
-  --prompt-tokens 128 --repeats 5 --n-threads 6
-```
-
-### Opções do benchmark
-
-| Flag | Default | Descrição |
-|---|---|---|
-| `--prompt-tokens` | 128 | Tokens de prefill |
-| `--repeats` | 5 | Repetições |
-| `--n-threads` | 6 | Threads CPU |
-| `--qat` | off | Calibração QAT antes do decode |
-
----
-
-## GPU GEMV Dispatch Flow
+### GEMV dispatch (7 operações por camada)
 
 ```
 Layer l:
   ┌─ x_norm (CPU RMSNorm) ────────────────────────┐
   │                                                │
-  │  [GPU] gemv_qkv_async(x_norm → q,k,v)         │
-  │    ⋮── 1× copy x to VRAM                      │
-  │    ⋮── 3× kernel_gemv_q4k (Q,K,V)             │
-  │    └── 3× copy out to host                       │
+  │  [CUDA Graph] gemv_qkv_async                   │
+  │    ├── cudaMemcpyAsync x → d_gemv_x            │
+  │    ├── kernel_gemv_q4k (Q, K, V)              │
+  │    └── 3× cudaMemcpyAsync → host (q,k,v)       │
   │                                                │
-  │  RoPE (CPU)                                    │
-  │  KV cache save (CPU)                           │
+  │  RoPE + KV save (CPU)                          │
   │                                                │
-  │  [GPU] execute_attention_async(q → attn_out)   │
-  │    ⋮── 1× copy q to VRAM                       │
-  │    ⋮── 1× CUDA Graph (attention)               │
-  │    └── 1× copy out to host                       │
+  │  [CUDA Graph] execute_attention_async          │
+  │    ├── cudaMemcpyAsync q → d_q                 │
+  │    ├── CUDA Graph replay (attention)           │
+  │    └── cudaMemcpyAsync → host (attn_out)       │
   │                                                │
-  │  [GPU] execute_gemv_async(attn_out → wo_out)   │
-  │    ⋮── 1× copy + kernel + copy                 │
+  │  [CUDA Graph] execute_gemv_async (O)           │
+  │  add_in_place + RMSNorm (CPU)                  │
   │                                                │
-  │  add_in_place (CPU)                            │
-  │  RMSNorm FFN (CPU)                             │
-  │                                                │
-  │  [GPU] gemv_gate_up_async(x_norm → gate,up)   │
-  │    ⋮── 1× copy x to VRAM                       │
-  │    ⋮── 2× kernel_gemv_q4k (Gate,Up)           │
-  │    └── 2× copy out to host                       │
-  │                                                │
+  │  [CUDA Graph] gemv_gate_up_async               │
   │  silu + mul (CPU)                              │
   │                                                │
-  │  [GPU] execute_gemv_async(ffn_gate → ffn_down)│
-  │    ⋮── 1× copy + kernel + copy                 │
-  │                                                │
+  │  [CUDA Graph] execute_gemv_async (Down)        │
   │  add_in_place (CPU)                            │
   └───────────────────────────────────────────────┘
-  Total: 4 GPU syncs/layer (1 por batch GEMV)
+  Total: 4 CUDA Graph replays + 4 syncs/layer
+```
+
+### Atenção esparsa (window=4096)
+
+KV cache em VRAM usa **ring buffer de 4096 posições** (22 MB/layer × 22 = 484 MB). Tokens anteriores a window são servidos da RAM do host via PCIe.
+
+### CUDA Graphs (fused GEMV)
+
+Cada graph captura: `cudaMemcpyAsync` + `kernel_gemv_q4k` × N + `cudaMemcpyAsync` × N numa única chamada `cudaGraphLaunch`. Criado lazy no 1º uso, replay nos seguintes.
+
+3 graph types:
+- `gpu_graph_create_gemv_qkv` — 1 copy + 3 kernels + 3 copy backs
+- `gpu_graph_create_gemv_gate_up` — 1 copy + 2 kernels + 2 copy backs
+- `gpu_graph_create_gemv_single` — 1 copy + 1 kernel + 1 copy back
+
+---
+
+## Uso
+
+### Build
+
+```bash
+# GPU habilitado (--features gpu)
+cargo build --release --features gpu
+
+# CPU-only
+cargo build --release
+```
+
+### Benchmark
+
+```bash
+# Single request (usa GPU GEMV + CUDA Graphs + atenção sparsa)
+cargo run --release --features gpu -p swamp-tools --bin swamp-benchmark-prefill -- \
+  /caminho/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  /caminho/tokenizer.json \
+  --prompt-tokens 128 --repeats 3
+
+# Pipeline concurrente (N requests em paralelo)
+cargo run --release --features gpu -p swamp-tools --bin swamp-benchmark-prefill -- \
+  /caminho/modelo.gguf /caminho/tokenizer.json \
+  --prompt-tokens 128 --pipeline 4
+```
+
+### Opções
+
+| Flag | Default | Descrição |
+|---|---|---|
+| `--prompt-tokens` | 128 | Tokens de prefill |
+| `--repeats` | 1 | Repetições do benchmark |
+| `--n-threads` | 6 | Threads CPU |
+| `--qat` | off | Calibração QAT |
+| `--pipeline` | 1 | Pipeline parallelism (N requests concorrentes) |
+
+### MSR unlock (AVX-512)
+
+```bash
+sudo wrmsr -a 0x1FC 0x4004005f  # +29% frequência AVX-512
 ```
 
 ---
 
-## Roadmap pra 100+ tok/s
+## Pipeline Concurrente
 
+```bash
+# 4 requests em paralelo (prefill sobrepõe decode)
+cargo run --release --features gpu -p swamp-tools --bin swamp-benchmark-prefill -- \
+  /caminho/modelo.gguf /caminho/tokenizer.json --pipeline 4
 ```
-1. ✅ GPU GEMV dispatch (7/layer) ─── batch QKV + GateUp
-2. ⬜ CUDA Graph fused (GEMVs + attention em 1 launch/layer)
-3. ⬜ Atenção GPU esparsa (window=4096 em VRAM)
-4. ⬜ Pipeline concurrente = prefill + decode sobrepostos
-```
+
+Cada worker roda `ModelExecutor::generate()` independente com KV cache própria. Job queue via `Arc<Mutex<Vec>>>`.
+
+---
+
+## Componentes
+
+### ✅ GPU (via `--features gpu`)
+
+| Componente | Arquivo | Descrição |
+|---|---|---|
+| **7 GEMVs/layer dispatch** | `scheduler.rs:350-471` | CUDA Graph replay com fallback async |
+| **CUDA Graph fused** | `fused_attention.cu:1218-1348` | QKV, GateUp, Single — 4 replays/layer |
+| **Atenção sparsa window** | `scheduler.rs:267-340` | Ring buffer KV em VRAM (window=4096) |
+| **CUDA attention graph** | `scheduler.rs:70-164` | Graph cache por seq_len |
+| **FP16 KV cache GPU** | `scheduler.rs:262-265` | Upload async via copy stream |
+| **Upload pesos VRAM** | `executor.rs:399-424` | 7 tensores na init via stream temporário |
+| **swamp_continuum SMs** | `fused_attention.cu:1144` | `<<<sm_count,256>>>` (14/14 SMs) |
+
+### ✅ Inovação
+
+| Componente | Arquivo | Descrição |
+|---|---|---|
+| **AIMD Resource Ramp** | `aimd.rs` | Dobra budget a cada 500ms, corta no 1º sinal |
+| **PowerArbiter** | `power_arbiter.rs` | RAPL+temp define split CPU/iGPU |
+| **ModelRegistry** | `model_registry.rs` | Múltiplos GGUFs por tier VRAM/RAM/CPU |
+| **ModelSwapper** | `model_swapper.rs` | LRU + pipeline prefetch |
+| **Pipeline** | `pipeline.rs` | 7 estágios, `execute_concurrent()` |
+| **Speculative decoding** | `dspark.rs` | Draft + acceptance check |
+| **Adaptive precision** | `linear.rs:115` | SENSITIVITY_MAP: rows sensíveis em FP16 |
 
 ---
 
 ## Comandos Úteis
 
 ```bash
-# Monitorar GPU
-nvidia-smi -l 1
-
-# MSR (precisa reaplicar após reboot)
-sudo wrmsr -a 0x1FC 0x4004005f
+# Rebuild .so (após modificar .cu)
+make -C swamp-gpu
 
 # Build GPU
 cargo build --release --features gpu
 
-# Build CPU
-cargo build --release
-
 # Verificar erros
 cargo build --release 2>&1 | grep "^error"
+
+# Testes
+cargo test --release -p swamp-engine -p swamp-kernels
+
+# MSR unlock
+sudo modprobe msr && sudo wrmsr -a 0x1FC 0x4004005f
 ```
