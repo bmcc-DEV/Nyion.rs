@@ -393,64 +393,41 @@ impl ModelExecutor {
             // M:N Scheduler — GPU stream manager + persistent K/V buffers
             #[cfg(feature = "gpu")]
             let mut per_layer_gpu: Option<crate::scheduler::PerLayerGpuState> = {
-                let max_seq = model.config.context_len.max(2048);
-                let stream_mgr = crate::scheduler::GpuStreamManager::new(
-                    num_heads, num_kv_heads, max_seq, head_dim,
-                );
-                let (gpu, d_k, d_v) = match stream_mgr {
-                    Some(gpu) => {
-                        if swamp_gpu::gpu_init().is_err() {
-                            tracing::warn!("GPU init failed (falling back to CPU attention)");
-                            (None, None, None)
-                        } else {
-                            let dk = swamp_gpu::gpu_alloc_kv_buffer_half(num_kv_heads, max_seq, head_dim).ok();
-                            let dv = swamp_gpu::gpu_alloc_kv_buffer_half(num_kv_heads, max_seq, head_dim).ok();
-                            match (dk, dv) {
-                                (Some(dk_ptr), Some(dv_ptr)) => (Some(gpu), Some(dk_ptr), Some(dv_ptr)),
-                                _ => {
-                                    tracing::warn!("GPU KV buffer alloc failed (falling back to CPU attention)");
-                                    (None, None, None)
-                                }
-                            }
-                        }
-                    }
-                    None => (None, None, None),
-                };
-                gpu.map(|gpu| {
-                    use crate::scheduler::PerLayerGpuState;
-                    let d_gemv_x: *mut f32 = unsafe { swamp_gpu::gpu_alloc((ffn_dim.max(embed_dim) * 4)).ok() } as *mut f32;
-                    let d_gemv_out: *mut f32 = unsafe { swamp_gpu::gpu_alloc((ffn_dim.max(embed_dim) * 4)).ok() } as *mut f32;
-                    let stream = gpu.compute_stream;
-                    // Helper: upload a tensor's raw data to VRAM given its name
-                    let upload_tensor = |name: &str| -> *mut u8 {
-                        let (off, len) = match model.gguf.tensor_raw_offset_len(name) {
-                            Some(v) => v,
-                            None => return std::ptr::null_mut(),
+                let window_size = 4096usize.min(model.config.context_len.max(4096));
+                // Upload weights to VRAM, then create PerLayerGpuState with KV window
+                let upload_stream = swamp_gpu::gpu_stream_create().ok();
+                let (d_qw, d_kw, d_vw, d_ow, d_gw, d_uw, d_dw) = match upload_stream {
+                    Some(us) => {
+                        use crate::scheduler::PerLayerGpuState;
+                        let u = |name: &str| -> *mut u8 {
+                            let (off, len) = model.gguf.tensor_raw_offset_len(name).unwrap_or((0,0));
+                            if len == 0 { return std::ptr::null_mut(); }
+                            let (mp, _) = model.gguf.mmap_ptr_and_len();
+                            let h_ptr = unsafe { mp.add(off) as *const u8 };
+                            PerLayerGpuState::upload_weight(h_ptr, len, us).unwrap_or(std::ptr::null_mut())
                         };
-                        let (mp, _) = model.gguf.mmap_ptr_and_len();
-                        let h_ptr = unsafe { mp.add(off) as *const u8 };
-                        PerLayerGpuState::upload_weight(h_ptr, len, stream).unwrap_or(std::ptr::null_mut())
-                    };
-                    PerLayerGpuState {
-                        gpu: Box::new(gpu),
-                        d_k_buf: d_k.unwrap_or(std::ptr::null_mut()),
-                        d_v_buf: d_v.unwrap_or(std::ptr::null_mut()),
-                        max_seq_len: max_seq,
-                        n_kv_heads: num_kv_heads,
-                        d_q_weight: upload_tensor("blk.0.attn_q.weight"),
-                        d_k_weight: upload_tensor("blk.0.attn_k.weight"),
-                        d_v_weight: upload_tensor("blk.0.attn_v.weight"),
-                        d_o_weight: upload_tensor("blk.0.attn_output.weight"),
-                        d_gate_weight: upload_tensor("blk.0.ffn_gate.weight"),
-                        d_up_weight: upload_tensor("blk.0.ffn_up.weight"),
-                        d_down_weight: upload_tensor("blk.0.ffn_down.weight"),
-                        d_gemv_x,
-                        d_gemv_out,
-                        max_gemv_cols: embed_dim.max(ffn_dim) as i32,
-                        max_gemv_rows: embed_dim.max(ffn_dim).max(num_heads * head_dim) as i32,
-                        total_vram_mb: 0.0,
+                        let r = (u("blk.0.attn_q.weight"), u("blk.0.attn_k.weight"),
+                                 u("blk.0.attn_v.weight"), u("blk.0.attn_output.weight"),
+                                 u("blk.0.ffn_gate.weight"), u("blk.0.ffn_up.weight"),
+                                 u("blk.0.ffn_down.weight"));
+                        let _ = swamp_gpu::gpu_stream_synchronize(us);
+                        let _ = swamp_gpu::gpu_stream_destroy(us);
+                        r
                     }
-                })
+                    None => (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
+                             std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()),
+                };
+                use crate::scheduler::PerLayerGpuState;
+                let d_gemv_x: *mut f32 = unsafe { swamp_gpu::gpu_alloc((ffn_dim.max(embed_dim) * 4)).ok() } as *mut f32;
+                let d_gemv_out: *mut f32 = unsafe { swamp_gpu::gpu_alloc((ffn_dim.max(embed_dim) * 4)).ok() } as *mut f32;
+                PerLayerGpuState::new(
+                    window_size, num_heads, num_kv_heads, head_dim,
+                    d_qw, d_kw, d_vw, d_ow, d_gw, d_uw, d_dw,
+                    d_gemv_x, d_gemv_out,
+                    embed_dim.max(ffn_dim) as i32,
+                    embed_dim.max(ffn_dim).max(num_heads * head_dim) as i32,
+                    0.0,
+                )
             };
 
             // PrefetchEngine for madvise-based page prefetch
@@ -920,5 +897,90 @@ impl ModelExecutor {
             Ok(Err(e)) => Err(e),
             Err(e) => Err(anyhow::anyhow!("Join Error: {:?}", e)),
         }
+    }
+
+    /// Pipeline concurrente: processa até `max_concurrency` requests em paralelo,
+    /// sobrepondo prefill de uma com decode de outra via pipeline parallelism.
+    /// Cada request roda em sua própria thread com KV cache independente.
+    pub fn generate_batch(
+        &self,
+        requests: Vec<InferenceRequest>,
+        max_concurrency: usize,
+    ) -> Vec<anyhow::Result<String>> {
+        use std::sync::{mpsc, Arc, Mutex};
+        use std::thread;
+
+        let n = requests.len();
+        if n == 0 { return Vec::new(); }
+
+        let results: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(vec![None; n]));
+        let errors: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(vec![None; n]));
+
+        // Use a shared queue with mutex
+        let job_queue: Arc<Mutex<Vec<(usize, InferenceRequest)>>> = Arc::new(Mutex::new(
+            requests.into_iter().enumerate().collect()
+        ));
+
+        let mut handles = Vec::with_capacity(max_concurrency);
+        for _ in 0..max_concurrency.min(n) {
+            let jq = job_queue.clone();
+            let res = results.clone();
+            let errs = errors.clone();
+            let model = self.model.clone();
+            let token_embd = self.token_embd.clone();
+            let attn_norms = self.attn_norms.clone();
+            let ffn_norms = self.ffn_norms.clone();
+            let output_norm = self.output_norm.clone();
+            let policy_script = self.policy.script_path().to_string();
+
+            handles.push(thread::spawn(move || {
+                loop {
+                    let job = {
+                        let mut q = jq.lock().unwrap();
+                        q.pop()
+                    };
+                    let (idx, req) = match job {
+                        Some(j) => j,
+                        None => break,
+                    };
+                    let executor = ModelExecutor {
+                        model: model.clone(),
+                        thermal_coordinator: ThermalCoordinator::default(),
+                        prefetcher: LscPrefetcher::default(),
+                        policy: PolicyEngine::new(&policy_script, 6).unwrap_or_else(|_| PolicyEngine::new("", 6).unwrap()),
+                        token_embd: token_embd.clone(),
+                        attn_norms: attn_norms.clone(),
+                        ffn_norms: ffn_norms.clone(),
+                        output_norm: output_norm.clone(),
+                    };
+                    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+                    let result = tokio::runtime::Runtime::new()
+                        .unwrap()
+                        .block_on(async move {
+                            let mut exec = executor;
+                            let _ = exec.generate(req, tx.clone()).await;
+                            let mut output = String::new();
+                            while let Some(msg) = rx.blocking_recv() {
+                                output.push_str(&msg);
+                            }
+                            output
+                        });
+                    let mut r = res.lock().unwrap();
+                    r[idx] = Some(result);
+                }
+            }));
+        }
+
+        for h in handles {
+            let _ = h.join();
+        }
+
+        let final_results = results.lock().unwrap();
+        final_results.iter().map(|r| {
+            match r {
+                Some(s) => Ok(s.clone()),
+                None => Err(anyhow::anyhow!("request failed")),
+            }
+        }).collect()
     }
 }

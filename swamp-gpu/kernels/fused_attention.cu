@@ -1134,6 +1134,15 @@ void gpu_swamp_init(
     cudaMemset((void*)*d_shutdown, 0, sizeof(int));
 }
 
+// Buffer pinned para opcodes (alocado uma vez, reutilizado)
+static SwampOpcode* pinned_op_buf = NULL;
+
+void gpu_swamp_alloc_pinned() {
+    if (pinned_op_buf == NULL) {
+        cudaHostAlloc(&pinned_op_buf, sizeof(SwampOpcode), cudaHostAllocDefault);
+    }
+}
+
 void gpu_swamp_launch(
     SwampRingBuffer* d_ring,
     const uint8_t* d_w_base,
@@ -1146,13 +1155,6 @@ void gpu_swamp_launch(
     if (sm_count < 1) sm_count = 1;
     swamp_continuum<<<sm_count, 256, 0, kernel_stream>>>(d_ring, d_w_base, d_state, d_shutdown);
     gpu_swamp_alloc_pinned();
-}
-
-// Buffer pinned para opcodes (alocado uma vez, reutilizado)
-static SwampOpcode* pinned_op_buf = NULL;
-
-void gpu_swamp_alloc_pinned() {
-    cudaHostAlloc(&pinned_op_buf, sizeof(SwampOpcode), cudaHostAllocDefault);
 }
 
 void gpu_swamp_free_pinned() {
@@ -1213,6 +1215,134 @@ void gpu_swamp_shutdown(int* d_shutdown, cudaStream_t stream) {
 int gpu_stream_sync(cudaStream_t stream) {
     cudaError_t e = cudaStreamSynchronize(stream);
     return (int)e;
+}
+
+// ===========================================================================
+// CUDA Graph: GEMV QKV batch — captures copy x + 3 GEMVs + 3 copy backs
+// All host pointers must be stable (pinned or fixed Vec), all device ptrs pre-alloc
+// ===========================================================================
+void* gpu_graph_create_gemv_qkv(
+    const uint8_t* d_w_q, const uint8_t* d_w_k, const uint8_t* d_w_v,
+    float* d_x, float* d_out,
+    const float* h_x, float* h_q, float* h_k, float* h_v,
+    int n_rows_q, int n_rows_k, int n_rows_v, int n_blocks,
+    int x_bytes, int out_bytes_q, int out_bytes_k, int out_bytes_v
+) {
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+    cudaGraph_t graph;
+    cudaGraphCreate(&graph, 0);
+
+    int blocks_q = (n_rows_q + 255) / 256;
+    int blocks_k = (n_rows_k + 255) / 256;
+    int blocks_v = (n_rows_v + 255) / 256;
+
+    cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+
+    cudaMemcpyAsync(d_x, h_x, x_bytes, cudaMemcpyHostToDevice, stream);
+    kernel_gemv_q4k<<<blocks_q, 256, 0, stream>>>(d_w_q, d_x, d_out, n_rows_q, n_blocks, 0.0f, 0.0f);
+    cudaMemcpyAsync(h_q, d_out, out_bytes_q, cudaMemcpyDeviceToHost, stream);
+    kernel_gemv_q4k<<<blocks_k, 256, 0, stream>>>(d_w_k, d_x, d_out, n_rows_k, n_blocks, 0.0f, 0.0f);
+    cudaMemcpyAsync(h_k, d_out, out_bytes_k, cudaMemcpyDeviceToHost, stream);
+    kernel_gemv_q4k<<<blocks_v, 256, 0, stream>>>(d_w_v, d_x, d_out, n_rows_v, n_blocks, 0.0f, 0.0f);
+    cudaMemcpyAsync(h_v, d_out, out_bytes_v, cudaMemcpyDeviceToHost, stream);
+
+    cudaError_t err = cudaStreamEndCapture(stream, &graph);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_graph_create_gemv_qkv: capture failed: %s\n", cudaGetErrorString(err));
+        cudaStreamDestroy(stream);
+        return NULL;
+    }
+    cudaGraphExec_t graph_exec;
+    err = cudaGraphInstantiate(&graph_exec, graph, NULL, NULL, 0);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_graph_create_gemv_qkv: instantiate failed: %s\n", cudaGetErrorString(err));
+        cudaGraphDestroy(graph);
+        cudaStreamDestroy(stream);
+        return NULL;
+    }
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(stream);
+    return (void*)graph_exec;
+}
+
+// CUDA Graph: Gate+Up GEMV batch — copies x once, 2 kernels, 2 copy backs
+void* gpu_graph_create_gemv_gate_up(
+    const uint8_t* d_w_gate, const uint8_t* d_w_up,
+    float* d_x, float* d_out,
+    const float* h_x, float* h_gate, float* h_up,
+    int n_rows, int n_blocks,
+    int x_bytes, int out_bytes
+) {
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+    cudaGraph_t graph;
+    cudaGraphCreate(&graph, 0);
+
+    int blocks = (n_rows + 255) / 256;
+
+    cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+
+    cudaMemcpyAsync(d_x, h_x, x_bytes, cudaMemcpyHostToDevice, stream);
+    kernel_gemv_q4k<<<blocks, 256, 0, stream>>>(d_w_gate, d_x, d_out, n_rows, n_blocks, 0.0f, 0.0f);
+    cudaMemcpyAsync(h_gate, d_out, out_bytes, cudaMemcpyDeviceToHost, stream);
+    kernel_gemv_q4k<<<blocks, 256, 0, stream>>>(d_w_up, d_x, d_out, n_rows, n_blocks, 0.0f, 0.0f);
+    cudaMemcpyAsync(h_up, d_out, out_bytes, cudaMemcpyDeviceToHost, stream);
+
+    cudaError_t err = cudaStreamEndCapture(stream, &graph);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_graph_create_gemv_gate_up: capture failed: %s\n", cudaGetErrorString(err));
+        cudaStreamDestroy(stream);
+        return NULL;
+    }
+    cudaGraphExec_t graph_exec;
+    err = cudaGraphInstantiate(&graph_exec, graph, NULL, NULL, 0);
+    if (err != cudaSuccess) {
+        cudaGraphDestroy(graph);
+        cudaStreamDestroy(stream);
+        return NULL;
+    }
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(stream);
+    return (void*)graph_exec;
+}
+
+// CUDA Graph: single GEMV — copy x + kernel + copy out
+void* gpu_graph_create_gemv_single(
+    const uint8_t* d_w,
+    float* d_x, float* d_out,
+    const float* h_x, float* h_out,
+    int n_rows, int n_blocks,
+    int x_bytes, int out_bytes
+) {
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+    cudaGraph_t graph;
+    cudaGraphCreate(&graph, 0);
+
+    int blocks = (n_rows + 255) / 256;
+
+    cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+
+    cudaMemcpyAsync(d_x, h_x, x_bytes, cudaMemcpyHostToDevice, stream);
+    kernel_gemv_q4k<<<blocks, 256, 0, stream>>>(d_w, d_x, d_out, n_rows, n_blocks, 0.0f, 0.0f);
+    cudaMemcpyAsync(h_out, d_out, out_bytes, cudaMemcpyDeviceToHost, stream);
+
+    cudaError_t err = cudaStreamEndCapture(stream, &graph);
+    if (err != cudaSuccess) {
+        cudaStreamDestroy(stream);
+        return NULL;
+    }
+    cudaGraphExec_t graph_exec;
+    err = cudaGraphInstantiate(&graph_exec, graph, NULL, NULL, 0);
+    if (err != cudaSuccess) {
+        cudaGraphDestroy(graph);
+        cudaStreamDestroy(stream);
+        return NULL;
+    }
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(stream);
+    return (void*)graph_exec;
 }
 
 } // extern "C"

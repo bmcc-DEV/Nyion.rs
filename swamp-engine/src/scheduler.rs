@@ -230,8 +230,9 @@ pub struct PerLayerGpuState {
     pub gpu: Box<GpuStreamManager>,
     pub d_k_buf: *mut std::ffi::c_void,
     pub d_v_buf: *mut std::ffi::c_void,
-    pub max_seq_len: usize,
+    pub window_size: usize,
     pub n_kv_heads: usize,
+    pub head_dim: usize,
     // GPU GEMV device weight pointers (uploaded once per layer group)
     pub d_q_weight: *mut u8,
     pub d_k_weight: *mut u8,
@@ -245,6 +246,11 @@ pub struct PerLayerGpuState {
     pub d_gemv_out: *mut f32,
     pub max_gemv_cols: i32,
     pub max_gemv_rows: i32,
+    // CUDA Graph handles for GEMV batches (per layer, created lazily)
+    pub graph_qkv: Option<swamp_gpu::GemvGraph>,
+    pub graph_gate_up: Option<swamp_gpu::GemvGraph>,
+    pub graph_o: Option<swamp_gpu::GemvGraph>,
+    pub graph_down: Option<swamp_gpu::GemvGraph>,
     // Estimated VRAM usage tracking
     pub total_vram_mb: f32,
 }
@@ -256,17 +262,50 @@ unsafe impl Sync for PerLayerGpuState {}
 
 #[cfg(feature = "gpu")]
 impl PerLayerGpuState {
-    /// Pre-upload K/V to the GPU FP16 buffer for the given position.
-    /// Must be called after `kv_cache.save()` and before `execute_attention_async()`.
-    /// Returns true if the copy was submitted successfully.
-    pub fn upload_kv_async(&mut self, h_k: &[f32], h_v: &[f32], pos: usize) -> bool {
-        self.gpu.copy_kv_async(self.d_k_buf, h_k, pos, self.n_kv_heads)
-            && self.gpu.copy_kv_async(self.d_v_buf, h_v, pos, self.n_kv_heads)
+    pub fn new(
+        window_size: usize, num_heads: usize, n_kv_heads: usize, head_dim: usize,
+        d_q_weight: *mut u8, d_k_weight: *mut u8, d_v_weight: *mut u8,
+        d_o_weight: *mut u8, d_gate_weight: *mut u8, d_up_weight: *mut u8,
+        d_down_weight: *mut u8,
+        d_gemv_x: *mut f32, d_gemv_out: *mut f32,
+        max_gemv_cols: i32, max_gemv_rows: i32,
+        total_vram_mb: f32,
+    ) -> Option<Self> {
+        swamp_gpu::gpu_init().ok()?;
+        let d_k_buf = swamp_gpu::gpu_alloc_kv_buffer_half(n_kv_heads, window_size, head_dim).ok()?;
+        let d_v_buf = swamp_gpu::gpu_alloc_kv_buffer_half(n_kv_heads, window_size, head_dim).ok()?;
+        let gpu = GpuStreamManager::new(num_heads, n_kv_heads, window_size, head_dim)?;
+
+        Some(Self {
+            gpu: Box::new(gpu),
+            d_k_buf, d_v_buf,
+            window_size,
+            n_kv_heads,
+            head_dim,
+            d_q_weight, d_k_weight, d_v_weight,
+            d_o_weight, d_gate_weight, d_up_weight, d_down_weight,
+            d_gemv_x, d_gemv_out,
+            max_gemv_cols, max_gemv_rows,
+            graph_qkv: None,
+            graph_gate_up: None,
+            graph_o: None,
+            graph_down: None,
+            total_vram_mb,
+        })
     }
 
-    /// Run GPU attention for one layer asynchronously, using pre-uploaded KV
-    /// (uploaded via `upload_kv_async`). Does NOT copy KV — assumes resident on GPU.
-    /// Returns true if GPU execution was launched successfully.
+    /// Pre-upload K/V to the GPU FP16 buffer for the given position.
+    /// Only the last `window_size` positions are kept in VRAM.
+    /// Returns true if the copy was submitted successfully.
+    pub fn upload_kv_async(&mut self, h_k: &[f32], h_v: &[f32], pos: usize) -> bool {
+        // Map position into window buffer (ring buffer of window_size)
+        let wpos = pos % self.window_size;
+        self.gpu.copy_kv_async(self.d_k_buf, h_k, wpos, self.n_kv_heads)
+            && self.gpu.copy_kv_async(self.d_v_buf, h_v, wpos, self.n_kv_heads)
+    }
+
+    /// Run GPU attention with sparsa window.
+    /// Only attends within the last `window_size` tokens in VRAM.
     pub fn execute_attention_async(
         &mut self,
         h_q: &[f32],
@@ -277,16 +316,17 @@ impl PerLayerGpuState {
         if !self.gpu.is_operational() {
             return false;
         }
+        let attn_len = seq_len.min(self.window_size);
+        if attn_len == 0 { return false; }
 
-        // Q copy + launch attention + output copy on compute stream
         let q_ok = self.gpu.copy_q_async(h_q);
         if !q_ok { return false; }
 
         let launch_ok = self.gpu.launch_attention_half(
             self.d_k_buf as *const std::ffi::c_void,
             self.d_v_buf as *const std::ffi::c_void,
-            seq_len,
-            self.max_seq_len,
+            attn_len,
+            self.window_size,
             self.n_kv_heads,
         );
         if !launch_ok { return false; }
@@ -303,54 +343,80 @@ impl PerLayerGpuState {
     }
 
     /// Upload ring weight tensor to GPU VRAM (one-time).
-    /// `h_w` = host pointer (mmap), `bytes` = size.
-    /// Stores device pointer in `d_dst` field.
     pub fn upload_weight(h_w: *const u8, bytes: usize, stream: swamp_gpu::CudaStream) -> Option<*mut u8> {
         let mut d_w: *mut u8 = std::ptr::null_mut();
         swamp_gpu::gpu_upload_weights(h_w, &mut d_w as *mut *mut u8, bytes, stream).ok()?;
         Some(d_w)
     }
 
-    /// Run a Q4_K GEMV on GPU with pre-allocated buffers.
-    /// Copies h_x → device, launches kernel, copies result → h_out.
-    /// Returns false if GPU not available or weight is null (caller falls back to CPU).
+    // =====================================================================
+    // CUDA Graph GEMV methods
+    // Each method creates a CUDA Graph on first use, then replays it.
+    // Graphs capture: copy_x → kernel(s) → copy_out — 1 API call vs 3-7.
+    // =====================================================================
+
+    /// Run GEMV using CUDA Graph (single). Falls back to async if graph fails.
+    fn gemv_single_graph(
+        &mut self,
+        d_w: *const u8,
+        h_x: &[f32],
+        h_out: &mut [f32],
+        n_rows: i32,
+        n_blocks: i32,
+        graph_slot: &mut Option<swamp_gpu::GemvGraph>,
+    ) -> bool {
+        if d_w.is_null() { return false; }
+        let stream = self.gpu.compute_stream;
+        let x_bytes = (n_blocks as usize) * 256 * 4;
+        let out_bytes = (n_rows as usize) * 4;
+
+        if let Some(ref graph) = *graph_slot {
+            return swamp_gpu::gpu_graph_replay_gemv(graph, stream).is_ok();
+        }
+
+        // First use: try to create graph
+        let new_graph = swamp_gpu::gpu_graph_create_gemv_single(
+            d_w, self.d_gemv_x, self.d_gemv_out,
+            h_x.as_ptr(), h_out.as_mut_ptr(),
+            n_rows, n_blocks, x_bytes as i32, out_bytes as i32,
+        );
+        match new_graph {
+            Ok(g) => {
+                *graph_slot = Some(g);
+                swamp_gpu::gpu_graph_replay_gemv(graph_slot.as_ref().unwrap(), stream).is_ok()
+            }
+            Err(_) => {
+                // Fallback to async operations
+                swamp_gpu::gpu_copy_to_device_async(
+                    self.d_gemv_x as *mut _, h_x.as_ptr() as *const _, x_bytes, stream,
+                ).is_ok()
+                && swamp_gpu::gpu_gemv_q4k(
+                    d_w, self.d_gemv_x as *const f32, self.d_gemv_out,
+                    n_rows, n_blocks, stream,
+                ).is_ok()
+                && swamp_gpu::gpu_copy_to_host_async(
+                    h_out.as_mut_ptr() as *mut _, self.d_gemv_out as *const _,
+                    out_bytes, stream,
+                ).is_ok()
+            }
+        }
+    }
+
+    /// Run GEMV using CUDA Graph (no graph caching, single shot).
     pub fn execute_gemv_async(
-        &self,
+        &mut self,
         d_w: *const u8,
         h_x: &[f32],
         h_out: &mut [f32],
         n_rows: i32,
         n_blocks: i32,
     ) -> bool {
-        if d_w.is_null() { return false; }
-        let stream = self.gpu.compute_stream;
-        let x_bytes = (n_blocks as usize) * 256 * 4;
-        let out_bytes = (n_rows as usize) * 4;
-        swamp_gpu::gpu_copy_to_device_async(
-            self.d_gemv_x as *mut _,
-            h_x.as_ptr() as *const _,
-            x_bytes,
-            stream,
-        ).is_ok()
-        && swamp_gpu::gpu_gemv_q4k(
-            d_w,
-            self.d_gemv_x as *const f32,
-            self.d_gemv_out,
-            n_rows, n_blocks,
-            stream,
-        ).is_ok()
-        && swamp_gpu::gpu_copy_to_host_async(
-            h_out.as_mut_ptr() as *mut _,
-            self.d_gemv_out as *const _,
-            out_bytes,
-            stream,
-        ).is_ok()
+        self.gemv_single_graph(d_w, h_x, h_out, n_rows, n_blocks, &mut None)
     }
 
-    /// Batch Q/K/V GEMVs — copies x once, launches 3 kernels, copies 3 outputs.
-    /// Saves ~2× PCIe xfer vs calling execute_gemv_async 3×.
+    /// Batch Q/K/V GEMVs using CUDA Graph (1 API call vs 7).
     pub fn gemv_qkv_async(
-        &self,
+        &mut self,
         d_w_q: *const u8, d_w_k: *const u8, d_w_v: *const u8,
         h_x: &[f32],
         h_q: &mut [f32], h_k: &mut [f32], h_v: &mut [f32],
@@ -360,43 +426,50 @@ impl PerLayerGpuState {
         if d_w_q.is_null() || d_w_k.is_null() || d_w_v.is_null() { return false; }
         let stream = self.gpu.compute_stream;
         let x_bytes = (n_blocks as usize) * 256 * 4;
-        // Copy x once
-        if !swamp_gpu::gpu_copy_to_device_async(
-            self.d_gemv_x as *mut _, h_x.as_ptr() as *const _, x_bytes, stream,
-        ).is_ok() { return false; }
-        // Q: launch + copy out
-        if !swamp_gpu::gpu_gemv_q4k(
-            d_w_q, self.d_gemv_x as *const f32, self.d_gemv_out,
-            n_rows_q, n_blocks, stream,
-        ).is_ok() { return false; }
-        if !swamp_gpu::gpu_copy_to_host_async(
-            h_q.as_mut_ptr() as *mut _, self.d_gemv_out as *const _,
-            (n_rows_q as usize) * 4, stream,
-        ).is_ok() { return false; }
-        // K: launch + copy out
-        if !swamp_gpu::gpu_gemv_q4k(
-            d_w_k, self.d_gemv_x as *const f32, self.d_gemv_out,
-            n_rows_k, n_blocks, stream,
-        ).is_ok() { return false; }
-        if !swamp_gpu::gpu_copy_to_host_async(
-            h_k.as_mut_ptr() as *mut _, self.d_gemv_out as *const _,
-            (n_rows_k as usize) * 4, stream,
-        ).is_ok() { return false; }
-        // V: launch + copy out
-        if !swamp_gpu::gpu_gemv_q4k(
-            d_w_v, self.d_gemv_x as *const f32, self.d_gemv_out,
-            n_rows_v, n_blocks, stream,
-        ).is_ok() { return false; }
-        if !swamp_gpu::gpu_copy_to_host_async(
-            h_v.as_mut_ptr() as *mut _, self.d_gemv_out as *const _,
-            (n_rows_v as usize) * 4, stream,
-        ).is_ok() { return false; }
-        true
+
+        // Try graph replay first
+        if let Some(ref graph) = self.graph_qkv {
+            return swamp_gpu::gpu_graph_replay_gemv(graph, stream).is_ok();
+        }
+
+        // First use: create graph
+        let new_graph = swamp_gpu::gpu_graph_create_gemv_qkv(
+            d_w_q, d_w_k, d_w_v,
+            self.d_gemv_x, self.d_gemv_out,
+            h_x.as_ptr(), h_q.as_mut_ptr(), h_k.as_mut_ptr(), h_v.as_mut_ptr(),
+            n_rows_q, n_rows_k, n_rows_v, n_blocks,
+            x_bytes as i32,
+            (n_rows_q as usize * 4) as i32,
+            (n_rows_k as usize * 4) as i32,
+            (n_rows_v as usize * 4) as i32,
+        );
+        match new_graph {
+            Ok(g) => {
+                self.graph_qkv = Some(g);
+                swamp_gpu::gpu_graph_replay_gemv(self.graph_qkv.as_ref().unwrap(), stream).is_ok()
+            }
+            Err(_) => {
+                // Fallback: individual async calls
+                if !swamp_gpu::gpu_copy_to_device_async(
+                    self.d_gemv_x as *mut _, h_x.as_ptr() as *const _, x_bytes, stream,
+                ).is_ok() { return false; }
+                // Q
+                if !swamp_gpu::gpu_gemv_q4k(d_w_q, self.d_gemv_x as *const f32, self.d_gemv_out, n_rows_q, n_blocks, stream).is_ok() { return false; }
+                if !swamp_gpu::gpu_copy_to_host_async(h_q.as_mut_ptr() as *mut _, self.d_gemv_out as *const _, (n_rows_q as usize) * 4, stream).is_ok() { return false; }
+                // K
+                if !swamp_gpu::gpu_gemv_q4k(d_w_k, self.d_gemv_x as *const f32, self.d_gemv_out, n_rows_k, n_blocks, stream).is_ok() { return false; }
+                if !swamp_gpu::gpu_copy_to_host_async(h_k.as_mut_ptr() as *mut _, self.d_gemv_out as *const _, (n_rows_k as usize) * 4, stream).is_ok() { return false; }
+                // V
+                if !swamp_gpu::gpu_gemv_q4k(d_w_v, self.d_gemv_x as *const f32, self.d_gemv_out, n_rows_v, n_blocks, stream).is_ok() { return false; }
+                if !swamp_gpu::gpu_copy_to_host_async(h_v.as_mut_ptr() as *mut _, self.d_gemv_out as *const _, (n_rows_v as usize) * 4, stream).is_ok() { return false; }
+                true
+            }
+        }
     }
 
-    /// Batch Gate/Up GEMVs — copies x once, launches 2 kernels, copies 2 outputs.
+    /// Batch Gate/Up GEMVs using CUDA Graph (1 API call vs 5).
     pub fn gemv_gate_up_async(
-        &self,
+        &mut self,
         d_w_gate: *const u8, d_w_up: *const u8,
         h_x: &[f32],
         h_gate: &mut [f32], h_up: &mut [f32],
@@ -405,29 +478,34 @@ impl PerLayerGpuState {
         if d_w_gate.is_null() || d_w_up.is_null() { return false; }
         let stream = self.gpu.compute_stream;
         let x_bytes = (n_blocks as usize) * 256 * 4;
-        if !swamp_gpu::gpu_copy_to_device_async(
-            self.d_gemv_x as *mut _, h_x.as_ptr() as *const _, x_bytes, stream,
-        ).is_ok() { return false; }
-        let out_bytes = (n_rows as usize) * 4;
-        // Gate
-        if !swamp_gpu::gpu_gemv_q4k(
-            d_w_gate, self.d_gemv_x as *const f32, self.d_gemv_out,
-            n_rows, n_blocks, stream,
-        ).is_ok() { return false; }
-        if !swamp_gpu::gpu_copy_to_host_async(
-            h_gate.as_mut_ptr() as *mut _, self.d_gemv_out as *const _,
-            out_bytes, stream,
-        ).is_ok() { return false; }
-        // Up
-        if !swamp_gpu::gpu_gemv_q4k(
-            d_w_up, self.d_gemv_x as *const f32, self.d_gemv_out,
-            n_rows, n_blocks, stream,
-        ).is_ok() { return false; }
-        if !swamp_gpu::gpu_copy_to_host_async(
-            h_up.as_mut_ptr() as *mut _, self.d_gemv_out as *const _,
-            out_bytes, stream,
-        ).is_ok() { return false; }
-        true
+
+        if let Some(ref graph) = self.graph_gate_up {
+            return swamp_gpu::gpu_graph_replay_gemv(graph, stream).is_ok();
+        }
+
+        let new_graph = swamp_gpu::gpu_graph_create_gemv_gate_up(
+            d_w_gate, d_w_up,
+            self.d_gemv_x, self.d_gemv_out,
+            h_x.as_ptr(), h_gate.as_mut_ptr(), h_up.as_mut_ptr(),
+            n_rows, n_blocks,
+            x_bytes as i32,
+            (n_rows as usize * 4) as i32,
+        );
+        match new_graph {
+            Ok(g) => {
+                self.graph_gate_up = Some(g);
+                swamp_gpu::gpu_graph_replay_gemv(self.graph_gate_up.as_ref().unwrap(), stream).is_ok()
+            }
+            Err(_) => {
+                if !swamp_gpu::gpu_copy_to_device_async(self.d_gemv_x as *mut _, h_x.as_ptr() as *const _, x_bytes, stream).is_ok() { return false; }
+                let out_bytes = (n_rows as usize) * 4;
+                if !swamp_gpu::gpu_gemv_q4k(d_w_gate, self.d_gemv_x as *const f32, self.d_gemv_out, n_rows, n_blocks, stream).is_ok() { return false; }
+                if !swamp_gpu::gpu_copy_to_host_async(h_gate.as_mut_ptr() as *mut _, self.d_gemv_out as *const _, out_bytes, stream).is_ok() { return false; }
+                if !swamp_gpu::gpu_gemv_q4k(d_w_up, self.d_gemv_x as *const f32, self.d_gemv_out, n_rows, n_blocks, stream).is_ok() { return false; }
+                if !swamp_gpu::gpu_copy_to_host_async(h_up.as_mut_ptr() as *mut _, self.d_gemv_out as *const _, out_bytes, stream).is_ok() { return false; }
+                true
+            }
+        }
     }
 }
 
@@ -447,6 +525,10 @@ impl Drop for PerLayerGpuState {
         if !self.d_gate_weight.is_null() { swamp_gpu::gpu_free_weights(self.d_gate_weight).ok(); }
         if !self.d_up_weight.is_null() { swamp_gpu::gpu_free_weights(self.d_up_weight).ok(); }
         if !self.d_down_weight.is_null() { swamp_gpu::gpu_free_weights(self.d_down_weight).ok(); }
+        if let Some(g) = self.graph_qkv.take() { let _ = swamp_gpu::gpu_graph_destroy_gemv(g); }
+        if let Some(g) = self.graph_gate_up.take() { let _ = swamp_gpu::gpu_graph_destroy_gemv(g); }
+        if let Some(g) = self.graph_o.take() { let _ = swamp_gpu::gpu_graph_destroy_gemv(g); }
+        if let Some(g) = self.graph_down.take() { let _ = swamp_gpu::gpu_graph_destroy_gemv(g); }
     }
 }
 

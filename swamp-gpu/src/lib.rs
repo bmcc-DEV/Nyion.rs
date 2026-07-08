@@ -732,6 +732,87 @@ pub fn gpu_graph_destroy(graph: AttentionGraph) -> Result<()> {
     Ok(())
 }
 
+/// Opaque handle to a CUDA Graph executable for GEMV
+#[derive(Debug, Clone, Copy)]
+pub struct GemvGraph(*mut std::ffi::c_void);
+
+unsafe impl Send for GemvGraph {}
+unsafe impl Sync for GemvGraph {}
+
+impl GemvGraph {
+    pub fn is_null(&self) -> bool { self.0.is_null() }
+}
+
+/// Create a CUDA Graph for QKV GEMV batch (copy x, 3 kernels, 3 copy backs).
+/// All host/device pointers are fixed (pre-allocated buffers).
+pub fn gpu_graph_create_gemv_qkv(
+    d_w_q: *const u8, d_w_k: *const u8, d_w_v: *const u8,
+    d_x: *mut f32, d_out: *mut f32,
+    h_x: *const f32, h_q: *mut f32, h_k: *mut f32, h_v: *mut f32,
+    n_rows_q: i32, n_rows_k: i32, n_rows_v: i32, n_blocks: i32,
+    x_bytes: i32, out_bytes_q: i32, out_bytes_k: i32, out_bytes_v: i32,
+) -> Result<GemvGraph> {
+    let lib = try_lib()?;
+    let func: Symbol<unsafe extern "C" fn(*const u8,*const u8,*const u8,*mut f32,*mut f32,*const f32,*mut f32,*mut f32,*mut f32,i32,i32,i32,i32,i32,i32,i32,i32) -> *mut std::ffi::c_void> =
+        unsafe { lib.get(b"gpu_graph_create_gemv_qkv")? };
+    let ptr = unsafe { func(d_w_q, d_w_k, d_w_v, d_x, d_out, h_x, h_q, h_k, h_v, n_rows_q, n_rows_k, n_rows_v, n_blocks, x_bytes, out_bytes_q, out_bytes_k, out_bytes_v) };
+    if ptr.is_null() { return Err(GpuError::KernelError(-1)); }
+    Ok(GemvGraph(ptr))
+}
+
+/// Create a CUDA Graph for Gate+Up GEMV batch (copy x, 2 kernels, 2 copy backs).
+pub fn gpu_graph_create_gemv_gate_up(
+    d_w_gate: *const u8, d_w_up: *const u8,
+    d_x: *mut f32, d_out: *mut f32,
+    h_x: *const f32, h_gate: *mut f32, h_up: *mut f32,
+    n_rows: i32, n_blocks: i32,
+    x_bytes: i32, out_bytes: i32,
+) -> Result<GemvGraph> {
+    let lib = try_lib()?;
+    let func: Symbol<unsafe extern "C" fn(*const u8,*const u8,*mut f32,*mut f32,*const f32,*mut f32,*mut f32,i32,i32,i32,i32) -> *mut std::ffi::c_void> =
+        unsafe { lib.get(b"gpu_graph_create_gemv_gate_up")? };
+    let ptr = unsafe { func(d_w_gate, d_w_up, d_x, d_out, h_x, h_gate, h_up, n_rows, n_blocks, x_bytes, out_bytes) };
+    if ptr.is_null() { return Err(GpuError::KernelError(-1)); }
+    Ok(GemvGraph(ptr))
+}
+
+/// Create a CUDA Graph for single GEMV (copy x + kernel + copy out).
+pub fn gpu_graph_create_gemv_single(
+    d_w: *const u8,
+    d_x: *mut f32, d_out: *mut f32,
+    h_x: *const f32, h_out: *mut f32,
+    n_rows: i32, n_blocks: i32,
+    x_bytes: i32, out_bytes: i32,
+) -> Result<GemvGraph> {
+    let lib = try_lib()?;
+    let func: Symbol<unsafe extern "C" fn(*const u8,*mut f32,*mut f32,*const f32,*mut f32,i32,i32,i32,i32) -> *mut std::ffi::c_void> =
+        unsafe { lib.get(b"gpu_graph_create_gemv_single")? };
+    let ptr = unsafe { func(d_w, d_x, d_out, h_x, h_out, n_rows, n_blocks, x_bytes, out_bytes) };
+    if ptr.is_null() { return Err(GpuError::KernelError(-1)); }
+    Ok(GemvGraph(ptr))
+}
+
+/// Replay a GEMV CUDA Graph (reduces 3+ API calls to 1).
+pub fn gpu_graph_replay_gemv(graph: &GemvGraph, stream: CudaStream) -> Result<()> {
+    if graph.is_null() { return Err(GpuError::KernelError(-1)); }
+    let lib = try_lib()?;
+    let func: Symbol<unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32> =
+        unsafe { lib.get(b"gpu_graph_replay_attention")? }; // Same replay function, reused
+    let ret = unsafe { func(graph.0, stream.0) };
+    if ret != 0 { return Err(GpuError::KernelError(ret)); }
+    Ok(())
+}
+
+/// Destroy a GEMV graph executable
+pub fn gpu_graph_destroy_gemv(graph: GemvGraph) -> Result<()> {
+    if graph.is_null() { return Ok(()); }
+    let lib = try_lib()?;
+    let func: Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> =
+        unsafe { lib.get(b"gpu_graph_destroy")? }; // Same destroy function, reused
+    unsafe { func(graph.0) };
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // CUDA Event API (for HLC timeline correlation)
 // ---------------------------------------------------------------------------
