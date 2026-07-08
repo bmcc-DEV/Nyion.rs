@@ -311,8 +311,9 @@ impl PerLayerGpuState {
         Some(d_w)
     }
 
-    /// Run Q4_K GEMV on GPU using pre-allocated buffers (no malloc per call).
-    /// h_x → d_gemv_x (async copy), kernel, d_gemv_out → h_out (async copy).
+    /// Run a Q4_K GEMV on GPU with pre-allocated buffers.
+    /// Copies h_x → device, launches kernel, copies result → h_out.
+    /// Returns false if GPU not available or weight is null (caller falls back to CPU).
     pub fn execute_gemv_async(
         &self,
         d_w: *const u8,
@@ -322,13 +323,111 @@ impl PerLayerGpuState {
         n_blocks: i32,
     ) -> bool {
         if d_w.is_null() { return false; }
-        swamp_gpu::gpu_gemv_q4k_prealloc(
-            d_w, h_x, h_out,
-            self.d_gemv_x, self.d_gemv_out,
-            n_rows, n_blocks,
-            self.max_gemv_rows, self.max_gemv_cols,
-            self.gpu.compute_stream,
+        let stream = self.gpu.compute_stream;
+        let x_bytes = (n_blocks as usize) * 256 * 4;
+        let out_bytes = (n_rows as usize) * 4;
+        swamp_gpu::gpu_copy_to_device_async(
+            self.d_gemv_x as *mut _,
+            h_x.as_ptr() as *const _,
+            x_bytes,
+            stream,
         ).is_ok()
+        && swamp_gpu::gpu_gemv_q4k(
+            d_w,
+            self.d_gemv_x as *const f32,
+            self.d_gemv_out,
+            n_rows, n_blocks,
+            stream,
+        ).is_ok()
+        && swamp_gpu::gpu_copy_to_host_async(
+            h_out.as_mut_ptr() as *mut _,
+            self.d_gemv_out as *const _,
+            out_bytes,
+            stream,
+        ).is_ok()
+    }
+
+    /// Batch Q/K/V GEMVs — copies x once, launches 3 kernels, copies 3 outputs.
+    /// Saves ~2× PCIe xfer vs calling execute_gemv_async 3×.
+    pub fn gemv_qkv_async(
+        &self,
+        d_w_q: *const u8, d_w_k: *const u8, d_w_v: *const u8,
+        h_x: &[f32],
+        h_q: &mut [f32], h_k: &mut [f32], h_v: &mut [f32],
+        n_rows_q: i32, n_rows_k: i32, n_rows_v: i32,
+        n_blocks: i32,
+    ) -> bool {
+        if d_w_q.is_null() || d_w_k.is_null() || d_w_v.is_null() { return false; }
+        let stream = self.gpu.compute_stream;
+        let x_bytes = (n_blocks as usize) * 256 * 4;
+        // Copy x once
+        if !swamp_gpu::gpu_copy_to_device_async(
+            self.d_gemv_x as *mut _, h_x.as_ptr() as *const _, x_bytes, stream,
+        ).is_ok() { return false; }
+        // Q: launch + copy out
+        if !swamp_gpu::gpu_gemv_q4k(
+            d_w_q, self.d_gemv_x as *const f32, self.d_gemv_out,
+            n_rows_q, n_blocks, stream,
+        ).is_ok() { return false; }
+        if !swamp_gpu::gpu_copy_to_host_async(
+            h_q.as_mut_ptr() as *mut _, self.d_gemv_out as *const _,
+            (n_rows_q as usize) * 4, stream,
+        ).is_ok() { return false; }
+        // K: launch + copy out
+        if !swamp_gpu::gpu_gemv_q4k(
+            d_w_k, self.d_gemv_x as *const f32, self.d_gemv_out,
+            n_rows_k, n_blocks, stream,
+        ).is_ok() { return false; }
+        if !swamp_gpu::gpu_copy_to_host_async(
+            h_k.as_mut_ptr() as *mut _, self.d_gemv_out as *const _,
+            (n_rows_k as usize) * 4, stream,
+        ).is_ok() { return false; }
+        // V: launch + copy out
+        if !swamp_gpu::gpu_gemv_q4k(
+            d_w_v, self.d_gemv_x as *const f32, self.d_gemv_out,
+            n_rows_v, n_blocks, stream,
+        ).is_ok() { return false; }
+        if !swamp_gpu::gpu_copy_to_host_async(
+            h_v.as_mut_ptr() as *mut _, self.d_gemv_out as *const _,
+            (n_rows_v as usize) * 4, stream,
+        ).is_ok() { return false; }
+        true
+    }
+
+    /// Batch Gate/Up GEMVs — copies x once, launches 2 kernels, copies 2 outputs.
+    pub fn gemv_gate_up_async(
+        &self,
+        d_w_gate: *const u8, d_w_up: *const u8,
+        h_x: &[f32],
+        h_gate: &mut [f32], h_up: &mut [f32],
+        n_rows: i32, n_blocks: i32,
+    ) -> bool {
+        if d_w_gate.is_null() || d_w_up.is_null() { return false; }
+        let stream = self.gpu.compute_stream;
+        let x_bytes = (n_blocks as usize) * 256 * 4;
+        if !swamp_gpu::gpu_copy_to_device_async(
+            self.d_gemv_x as *mut _, h_x.as_ptr() as *const _, x_bytes, stream,
+        ).is_ok() { return false; }
+        let out_bytes = (n_rows as usize) * 4;
+        // Gate
+        if !swamp_gpu::gpu_gemv_q4k(
+            d_w_gate, self.d_gemv_x as *const f32, self.d_gemv_out,
+            n_rows, n_blocks, stream,
+        ).is_ok() { return false; }
+        if !swamp_gpu::gpu_copy_to_host_async(
+            h_gate.as_mut_ptr() as *mut _, self.d_gemv_out as *const _,
+            out_bytes, stream,
+        ).is_ok() { return false; }
+        // Up
+        if !swamp_gpu::gpu_gemv_q4k(
+            d_w_up, self.d_gemv_x as *const f32, self.d_gemv_out,
+            n_rows, n_blocks, stream,
+        ).is_ok() { return false; }
+        if !swamp_gpu::gpu_copy_to_host_async(
+            h_up.as_mut_ptr() as *mut _, self.d_gemv_out as *const _,
+            out_bytes, stream,
+        ).is_ok() { return false; }
+        true
     }
 }
 

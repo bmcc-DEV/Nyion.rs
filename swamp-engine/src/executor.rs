@@ -615,13 +615,36 @@ impl ModelExecutor {
                             rmsnorm(&mut x_norm, &x, &attn_norms[l], rms_eps);
 
                             // QKV Projections FUNDIDAS (shared weight across group)
-                            forward_linear_multi(
-                                &model.gguf,
-                                &[q_t, k_t, v_t],
-                                &x_norm,
-                                &mut [&mut q, &mut k, &mut v],
-                                n_threads,
-                            )?;
+                            let gemv_qkv_ok: bool = {
+                                #[cfg(feature = "gpu")]
+                                {
+                                    per_layer_gpu.as_ref().map_or(false, |gpu| {
+                                        let n_blocks = q_t.shape[0] / 256;
+                                        let ok = gpu.gemv_qkv_async(
+                                            gpu.d_q_weight as *const _,
+                                            gpu.d_k_weight as *const _,
+                                            gpu.d_v_weight as *const _,
+                                            &x_norm, &mut q, &mut k, &mut v,
+                                            q_t.shape[1] as i32,
+                                            k_t.shape[1] as i32,
+                                            v_t.shape[1] as i32,
+                                            n_blocks as i32,
+                                        );
+                                        ok && gpu.sync()
+                                    })
+                                }
+                                #[cfg(not(feature = "gpu"))]
+                                { false }
+                            };
+                            if !gemv_qkv_ok {
+                                forward_linear_multi(
+                                    &model.gguf,
+                                    &[q_t, k_t, v_t],
+                                    &x_norm,
+                                    &mut [&mut q, &mut k, &mut v],
+                                    n_threads,
+                                )?;
+                            }
 
                             // RoPE
                             apply_rope_ufc(&mut q, &mut k, pos, num_heads, num_kv_heads, head_dim, model.config.context_len);
@@ -691,26 +714,82 @@ impl ModelExecutor {
                             }
 
                             // Output Projection (shared weight)
-                            forward_linear(&model.gguf, o_t, &attn_out, &mut wo_out, n_threads)?;
+                            let gemv_o_ok: bool = {
+                                #[cfg(feature = "gpu")]
+                                {
+                                    per_layer_gpu.as_ref().map_or(false, |gpu| {
+                                        let ok = gpu.execute_gemv_async(
+                                            gpu.d_o_weight as *const _,
+                                            &attn_out, &mut wo_out,
+                                            o_t.shape[1] as i32,
+                                            (o_t.shape[0] / 256) as i32,
+                                        );
+                                        ok && gpu.sync()
+                                    })
+                                }
+                                #[cfg(not(feature = "gpu"))]
+                                { false }
+                            };
+                            if !gemv_o_ok {
+                                forward_linear(&model.gguf, o_t, &attn_out, &mut wo_out, n_threads)?;
+                            }
                             add_in_place(&mut x, &wo_out);
 
                             // RMSNorm FFN
                             rmsnorm(&mut x_norm, &x, &ffn_norms[l], rms_eps);
 
                             // FFN Gate & Up FUNDIDOS (shared weight)
-                            forward_linear_multi(
-                                &model.gguf,
-                                &[gate_t, up_t],
-                                &x_norm,
-                                &mut [&mut ffn_gate, &mut ffn_up],
-                                n_threads,
-                            )?;
+                            let gemv_gu_ok: bool = {
+                                #[cfg(feature = "gpu")]
+                                {
+                                    per_layer_gpu.as_ref().map_or(false, |gpu| {
+                                        let n_blocks = gate_t.shape[0] / 256;
+                                        let ok = gpu.gemv_gate_up_async(
+                                            gpu.d_gate_weight as *const _,
+                                            gpu.d_up_weight as *const _,
+                                            &x_norm, &mut ffn_gate, &mut ffn_up,
+                                            gate_t.shape[1] as i32,
+                                            n_blocks as i32,
+                                        );
+                                        ok && gpu.sync()
+                                    })
+                                }
+                                #[cfg(not(feature = "gpu"))]
+                                { false }
+                            };
+                            if !gemv_gu_ok {
+                                forward_linear_multi(
+                                    &model.gguf,
+                                    &[gate_t, up_t],
+                                    &x_norm,
+                                    &mut [&mut ffn_gate, &mut ffn_up],
+                                    n_threads,
+                                )?;
+                            }
 
                             silu(&mut ffn_gate);
                             mul_in_place(&mut ffn_gate, &ffn_up);
 
                             // FFN Down (shared weight)
-                            forward_linear(&model.gguf, down_t, &ffn_gate, &mut ffn_down, n_threads)?;
+                            let gemv_down_ok: bool = {
+                                #[cfg(feature = "gpu")]
+                                {
+                                    per_layer_gpu.as_ref().map_or(false, |gpu| {
+                                        let ok = gpu.execute_gemv_async(
+                                            gpu.d_down_weight as *const _,
+                                            &ffn_gate, &mut ffn_down,
+                                            down_t.shape[1] as i32,
+                                            (down_t.shape[0] / 256) as i32,
+                                        );
+                                        ok && gpu.sync()
+                                    })
+                                }
+                                #[cfg(not(feature = "gpu"))]
+                                { false }
+                            };
+                            if !gemv_down_ok {
+                                forward_linear(&model.gguf, down_t, &ffn_gate, &mut ffn_down, n_threads)?;
+                            }
                             add_in_place(&mut x, &ffn_down);
 
                             // Prefetch next group's first layer tensors (madvise WILLNEED)
