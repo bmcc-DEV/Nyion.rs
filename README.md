@@ -2,47 +2,49 @@
 
 Inferência de LLM em Rust + CUDA, targeting GPU NVIDIA (GTX 1650) + CPU AVX-512.
 
-**Branch:** `experimental-1m` — GPU GEMV dispatch, CUDA Graphs, atenção esparsa (window=4096).
+**Branch:** `experimental-1m` — GPU GEMV dispatch per-layer, CUDA Graphs, atenção esparsa (window=4096), ResourceGovernor + SwampVM.
 
 ---
 
 ## Stack
 
 ```
-┌─────────────────────────────────────────────────┐
-│  swamp-tools (benchmarks, CLI)                  │
-├─────────────────────────────────────────────────┤
-│  swamp-engine (executor, ops, linear, cache)     │
-│    ├── ModelExecutor (generate + generate_batch)│
-│    ├── GPU GEMV dispatch (7 GEMVs/layer)        │
-│    ├── CUDA Graph cache (QKV, GateUp, O, Down)  │
-│    ├── Atenção esparsa (window=4096 em VRAM)    │
-│    ├── DSpark (speculative decoding n-gram)      │
-│    ├── Fugu (strategy orchestrator)              │
-│    ├── Execution MoE (expert router VNNI/AVX2)   │
-│    ├── VNpu (EWMA schedulers)                    │
-│    ├── QAT (calibration 4-bit)                   │
-│    ├── LSC (prefetcher)                          │
-│    ├── AIMD Resource Ramp                        │
-│    ├── PowerArbiter CPU+iGPU                     │
-│    ├── StagingBuffer decoupled RAM               │
-│    ├── ModelRegistry + ModelSwapper              │
-│    └── Pipeline (concurrent stages)              │
-├─────────────────────────────────────────────────┤
-│  swamp-kernels (fused_gemv_q4k, fused_gemv_q6k) │
-│    ├── CPU: VNNI (AVX-512) + AVX2 + scalar      │
-│    └── GPU: kernel_gemv_q4k (CUDA, sm_75)        │
-├─────────────────────────────────────────────────┤
-│  swamp-gpu (CUDA FFI bridge)                     │
-│    ├── fused_attention.cu (1348 linhas)          │
-│    │   ├── kernel_gemv_q4k (device-only)         │
-│    │   ├── gpu_graph_create_gemv_qkv             │
-│    │   ├── gpu_graph_create_gemv_gate_up         │
-│    │   └── gpu_graph_create_gemv_single          │
-│    └── libswamp_gpu.so (rebuilt via make)        │
-├─────────────────────────────────────────────────┤
-│  swamp-gguf (leitor GGUF, dequant)               │
-└─────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────┐
+│  swamp-tools (benchmarks, CLI)                      │
+├─────────────────────────────────────────────────────┤
+│  swamp-engine (executor, ops, linear, cache)         │
+│    ├── ModelExecutor (generate + generate_batch)    │
+│    ├── GPU GEMV dispatch (7 GEMVs/layer, per-layer) │
+│    ├── CUDA Graph cache (QKV, GateUp, O, Down)     │
+│    ├── Atenção esparsa (window=4096 em VRAM)        │
+│    ├── Governor (admissão, backpressure, auto-tune) │
+│    ├── SwampVM (opcode ring + dispatcher persistente)│
+│    ├── DSpark (speculative decoding n-gram)          │
+│    ├── Fugu (strategy orchestrator)                  │
+│    ├── Execution MoE (expert router VNNI/AVX2)       │
+│    ├── VNpu (EWMA schedulers)                        │
+│    ├── QAT (calibration 4-bit)                       │
+│    ├── LSC (prefetcher)                              │
+│    ├── AIMD Resource Ramp                            │
+│    ├── PowerArbiter CPU+iGPU                         │
+│    ├── StagingBuffer decoupled RAM                   │
+│    ├── ModelRegistry + ModelSwapper                  │
+│    └── Pipeline (concurrent stages)                  │
+├─────────────────────────────────────────────────────┤
+│  swamp-kernels (fused_gemv_q4k, fused_gemv_q6k)     │
+│    ├── CPU: VNNI (AVX-512) + AVX2 + scalar          │
+│    └── GPU: kernel_gemv_q4k (CUDA, sm_75)            │
+├─────────────────────────────────────────────────────┤
+│  swamp-gpu (CUDA FFI bridge)                         │
+│    ├── fused_attention.cu (1348 linhas)              │
+│    │   ├── kernel_gemv_q4k (device-only)             │
+│    │   ├── gpu_graph_create_gemv_qkv                 │
+│    │   ├── gpu_graph_create_gemv_gate_up             │
+│    │   └── gpu_graph_create_gemv_single              │
+│    └── libswamp_gpu.so (rebuilt via make)            │
+├─────────────────────────────────────────────────────┤
+│  swamp-gguf (leitor GGUF, dequant)                   │
+└─────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -181,11 +183,13 @@ Cada worker roda `ModelExecutor::generate()` independente com KV cache própria.
 | Componente | Arquivo | Descrição |
 |---|---|---|
 | **7 GEMVs/layer dispatch** | `scheduler.rs:350-471` | CUDA Graph replay com fallback async |
+| **Per-layer weights** | `scheduler.rs:229-255` | `Vec<*mut u8>` indexado por layer — upload de todas as camadas na init |
+| **Per-layer graphs** | `scheduler.rs:251-254` | `Vec<Option<GemvGraph>>` — graph cache correto por camada |
 | **CUDA Graph fused** | `fused_attention.cu:1218-1348` | QKV, GateUp, Single — 4 replays/layer |
 | **Atenção sparsa window** | `scheduler.rs:267-340` | Ring buffer KV em VRAM (window=4096) |
 | **CUDA attention graph** | `scheduler.rs:70-164` | Graph cache por seq_len |
 | **FP16 KV cache GPU** | `scheduler.rs:262-265` | Upload async via copy stream |
-| **Upload pesos VRAM** | `executor.rs:399-424` | 7 tensores na init via stream temporário |
+| **Upload pesos VRAM** | `executor.rs:399-424` | 7 tensores × todas as camadas na init |
 | **swamp_continuum SMs** | `fused_attention.cu:1144` | `<<<sm_count,256>>>` (14/14 SMs) |
 
 ### ✅ Inovação
@@ -196,6 +200,9 @@ Cada worker roda `ModelExecutor::generate()` independente com KV cache própria.
 | **PowerArbiter** | `power_arbiter.rs` | RAPL+temp define split CPU/iGPU |
 | **ModelRegistry** | `model_registry.rs` | Múltiplos GGUFs por tier VRAM/RAM/CPU |
 | **ModelSwapper** | `model_swapper.rs` | LRU + pipeline prefetch |
+| **ResourceGovernor** | `governor.rs` | Unifica AIMD+Power+Registry+Swapper+Thermal; classificação de workload, admissão, auto-tuning de flags, backpressure |
+| **SwampVM** | `swamp_vm.rs` | Fila de opcodes nível sessão + dispatcher persistente; 3 backends (CPU/GPU/Cognitive); stale detection via generation counter |
+| **CognitiveWorkerPool** | `governor.rs` | Pool separado para classificadores CPU-only; bypassa SwampVM ring |
 | **Pipeline** | `pipeline.rs` | 7 estágios, `execute_concurrent()` |
 | **Speculative decoding** | `dspark.rs` | Draft + acceptance check |
 | **Adaptive precision** | `linear.rs:115` | SENSITIVITY_MAP: rows sensíveis em FP16 |

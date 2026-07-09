@@ -23,7 +23,7 @@ pub struct ModelSwapper {
     /// Ordem de uso recente (mais recente no fim)
     lru_order: VecDeque<String>,
     /// Máximo de VRAM disponível para modelos (bytes)
-    vram_capacity: usize,
+    pub vram_capacity: usize,
     /// Eventos de swap recentes (circular)
     swap_log: VecDeque<SwapEvent>,
     /// Pipeline hint: próximo modelo que será necessário

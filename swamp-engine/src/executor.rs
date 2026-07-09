@@ -27,7 +27,7 @@ use std::sync::OnceLock;
 
 pub static RAYON_POOL: OnceLock<ThreadPool> = OnceLock::new();
 
-fn get_rayon_pool() -> &'static ThreadPool {
+pub fn get_rayon_pool() -> &'static ThreadPool {
     RAYON_POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
             .num_threads(6)
@@ -123,7 +123,8 @@ fn prefill_slice(
                 for t in 0..batch {
                     let abs_pos = pos_offset + t;
                     let seq_len = abs_pos + 1;
-                    gpu.execute_attention_async(&qs[t], &ks[t], &vs[t], &mut attn_outs[t], abs_pos, seq_len);
+                    gpu.upload_kv_async(&ks[t], &vs[t], abs_pos);
+                    gpu.execute_attention_async(&qs[t], &mut attn_outs[t], abs_pos, seq_len);
                     gpu.sync();
                 }
             }
@@ -410,7 +411,6 @@ impl ModelExecutor {
             #[cfg(feature = "gpu")]
             let mut per_layer_gpu: Option<crate::scheduler::PerLayerGpuState> = {
                 let window_size = 4096usize.min(model.config.context_len.max(4096));
-                // Upload weights to VRAM, then create PerLayerGpuState with KV window
                 let upload_stream = swamp_gpu::gpu_stream_create().ok();
                 let (d_qw, d_kw, d_vw, d_ow, d_gw, d_uw, d_dw) = match upload_stream {
                     Some(us) => {
@@ -422,27 +422,29 @@ impl ModelExecutor {
                             let h_ptr = unsafe { mp.add(off) as *const u8 };
                             PerLayerGpuState::upload_weight(h_ptr, len, us).unwrap_or(std::ptr::null_mut())
                         };
-                        let r = (u("blk.0.attn_q.weight"), u("blk.0.attn_k.weight"),
-                                 u("blk.0.attn_v.weight"), u("blk.0.attn_output.weight"),
-                                 u("blk.0.ffn_gate.weight"), u("blk.0.ffn_up.weight"),
-                                 u("blk.0.ffn_down.weight"));
+                        // Upload all layers' weights
+                        let d_qw: Vec<*mut u8> = (0..num_layers).map(|l| u(&format!("blk.{l}.attn_q.weight"))).collect();
+                        let d_kw: Vec<*mut u8> = (0..num_layers).map(|l| u(&format!("blk.{l}.attn_k.weight"))).collect();
+                        let d_vw: Vec<*mut u8> = (0..num_layers).map(|l| u(&format!("blk.{l}.attn_v.weight"))).collect();
+                        let d_ow: Vec<*mut u8> = (0..num_layers).map(|l| u(&format!("blk.{l}.attn_output.weight"))).collect();
+                        let d_gw: Vec<*mut u8> = (0..num_layers).map(|l| u(&format!("blk.{l}.ffn_gate.weight"))).collect();
+                        let d_uw: Vec<*mut u8> = (0..num_layers).map(|l| u(&format!("blk.{l}.ffn_up.weight"))).collect();
+                        let d_dw: Vec<*mut u8> = (0..num_layers).map(|l| u(&format!("blk.{l}.ffn_down.weight"))).collect();
                         let _ = swamp_gpu::gpu_stream_synchronize(us);
                         let _ = swamp_gpu::gpu_stream_destroy(us);
-                        r
+                        (d_qw, d_kw, d_vw, d_ow, d_gw, d_uw, d_dw)
                     }
-                    None => (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
-                             std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()),
+                    None => (vec![], vec![], vec![], vec![], vec![], vec![], vec![]),
                 };
                 use crate::scheduler::PerLayerGpuState;
-                let d_gemv_x: *mut f32 = unsafe { swamp_gpu::gpu_alloc((ffn_dim.max(embed_dim) * 4)).ok() } as *mut f32;
-                let d_gemv_out: *mut f32 = unsafe { swamp_gpu::gpu_alloc((ffn_dim.max(embed_dim) * 4)).ok() } as *mut f32;
+                let d_gemv_x: *mut f32 = unsafe { swamp_gpu::gpu_alloc(ffn_dim.max(embed_dim) * 4) }.ok().map_or(std::ptr::null_mut(), |p| p as *mut f32);
+                let d_gemv_out: *mut f32 = unsafe { swamp_gpu::gpu_alloc(ffn_dim.max(embed_dim) * 4) }.ok().map_or(std::ptr::null_mut(), |p| p as *mut f32);
                 PerLayerGpuState::new(
-                    window_size, num_heads, num_kv_heads, head_dim,
+                    window_size, num_heads, num_kv_heads, head_dim, num_layers,
                     d_qw, d_kw, d_vw, d_ow, d_gw, d_uw, d_dw,
                     d_gemv_x, d_gemv_out,
                     embed_dim.max(ffn_dim) as i32,
                     embed_dim.max(ffn_dim).max(num_heads * head_dim) as i32,
-                    0.0,
                 )
             };
 
@@ -611,12 +613,13 @@ impl ModelExecutor {
                             let gemv_qkv_ok: bool = {
                                 #[cfg(feature = "gpu")]
                                 {
-                                    per_layer_gpu.as_ref().map_or(false, |gpu| {
+                                    per_layer_gpu.as_mut().map_or(false, |gpu| {
                                         let n_blocks = q_t.shape[0] / 256;
                                         let ok = gpu.gemv_qkv_async(
-                                            gpu.d_q_weight as *const _,
-                                            gpu.d_k_weight as *const _,
-                                            gpu.d_v_weight as *const _,
+                                            l,
+                                            gpu.d_q_weight.get(l).copied().unwrap_or(std::ptr::null_mut()),
+                                            gpu.d_k_weight.get(l).copied().unwrap_or(std::ptr::null_mut()),
+                                            gpu.d_v_weight.get(l).copied().unwrap_or(std::ptr::null_mut()),
                                             &x_norm, &mut q, &mut k, &mut v,
                                             q_t.shape[1] as i32,
                                             k_t.shape[1] as i32,
@@ -655,8 +658,9 @@ impl ModelExecutor {
                                 {
                                     let gpu_ok = per_layer_gpu.as_mut().map_or(false, |gpu| {
                                         let gpu_tic = profiler.clock().now();
+                                        gpu.upload_kv_async(&k, &v, pos);
                                         let launched = gpu.execute_attention_async(
-                                            &q, &k, &v, &mut attn_out, pos, seq_len,
+                                            &q, &mut attn_out, pos, seq_len,
                                         );
                                         if !launched {
                                             return false;
@@ -710,9 +714,10 @@ impl ModelExecutor {
                             let gemv_o_ok: bool = {
                                 #[cfg(feature = "gpu")]
                                 {
-                                    per_layer_gpu.as_ref().map_or(false, |gpu| {
+                                    per_layer_gpu.as_mut().map_or(false, |gpu| {
                                         let ok = gpu.execute_gemv_async(
-                                            gpu.d_o_weight as *const _,
+                                            l,
+                                            gpu.d_o_weight.get(l).copied().unwrap_or(std::ptr::null_mut()),
                                             &attn_out, &mut wo_out,
                                             o_t.shape[1] as i32,
                                             (o_t.shape[0] / 256) as i32,
@@ -735,11 +740,12 @@ impl ModelExecutor {
                             let gemv_gu_ok: bool = {
                                 #[cfg(feature = "gpu")]
                                 {
-                                    per_layer_gpu.as_ref().map_or(false, |gpu| {
+                                    per_layer_gpu.as_mut().map_or(false, |gpu| {
                                         let n_blocks = gate_t.shape[0] / 256;
                                         let ok = gpu.gemv_gate_up_async(
-                                            gpu.d_gate_weight as *const _,
-                                            gpu.d_up_weight as *const _,
+                                            l,
+                                            gpu.d_gate_weight.get(l).copied().unwrap_or(std::ptr::null_mut()),
+                                            gpu.d_up_weight.get(l).copied().unwrap_or(std::ptr::null_mut()),
                                             &x_norm, &mut ffn_gate, &mut ffn_up,
                                             gate_t.shape[1] as i32,
                                             n_blocks as i32,
@@ -767,9 +773,10 @@ impl ModelExecutor {
                             let gemv_down_ok: bool = {
                                 #[cfg(feature = "gpu")]
                                 {
-                                    per_layer_gpu.as_ref().map_or(false, |gpu| {
+                                    per_layer_gpu.as_mut().map_or(false, |gpu| {
                                         let ok = gpu.execute_gemv_async(
-                                            gpu.d_down_weight as *const _,
+                                            l,
+                                            gpu.d_down_weight.get(l).copied().unwrap_or(std::ptr::null_mut()),
                                             &ffn_gate, &mut ffn_down,
                                             down_t.shape[1] as i32,
                                             (down_t.shape[0] / 256) as i32,

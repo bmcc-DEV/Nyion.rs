@@ -18,6 +18,8 @@ tracing = { workspace = true }
 half = { workspace = true }
 libc = { workspace = true }
 swamp-gpu = { path = "../swamp-gpu", optional = true }
+crossbeam = "0.8.4"
+parking_lot = "0.12.5"
 
 [features]
 default = []
