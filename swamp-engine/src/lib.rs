@@ -28,6 +28,8 @@ pub mod model_swapper;
 pub mod governor;
 pub mod swamp_vm;
 pub mod pipeline;
+pub mod control_plane;
+pub mod data_plane;
 
 pub use cache::PagedKVCache;
 pub use executor::{ModelExecutor, InferenceRequest};
@@ -37,3 +39,5 @@ pub use lsc::LscPrefetcher;
 pub use model::{Model, ModelConfig};
 pub use sampler::Sampler;
 pub use thermal::{ThermalCoordinator, ThermalState};
+pub use control_plane::{CommandQueue, Command, ResourceHandle, CommandTag};
+pub use data_plane::DataPlane;

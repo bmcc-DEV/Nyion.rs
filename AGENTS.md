@@ -5,6 +5,13 @@
 cargo build --release -p swamp-tools --bin swamp-benchmark-prefill
 ```
 
+## Build with GPU
+```bash
+cd swamp-gpu/kernels && nvcc -O2 --std=c++17 -arch=sm_75 -shared -Xcompiler "-fPIC" \
+  fused_attention.cu -o ../libswamp_gpu.so && cd ../..
+cargo build --release --features gpu -p swamp-engine -p swamp-tools
+```
+
 ## Run benchmark (decode + prefill)
 ```bash
 cargo run --release -p swamp-tools --bin swamp-benchmark-prefill -- \
@@ -37,7 +44,17 @@ The benchmark prints per-layer timing breakdown:
 - Attention: scaled dot-product attention
 - RMSNorm: RMS normalization
 
+## Fused Layer Graph (GPU only)
+One CUDA Graph captures the entire transformer layer: RMSNorm → QKV → RoPE → KV save → Attention → O → add → RMSNorm → GateUp → SiLU+Mul → Down → add.
+- 12 CUDA kernels fused into 1 graph
+- seq_len and wpos passed via device pointers (updated before each replay)
+- Eliminates 4+ H2D/D2H copies and 5 syncs per layer
+- Fallback: individual per-op GPU graphs → CPU
+
 ## Key files
+- `swamp-gpu/kernels/fused_attention.cu` — all GPU kernels + layer graph API (C extern)
+- `swamp-gpu/src/lib.rs` — Rust FFI for `LayerGraph` and all GPU functions
+- `swamp-engine/src/scheduler.rs` — `PerLayerGpuState` with fused graph management
+- `swamp-engine/src/executor.rs` — decode loop with fused graph path
 - `swamp-kernels/src/fused_gemv_q4k.rs` — VNNI/AVX2/scalar GEMV kernels
-- `swamp-engine/src/linear.rs` — ring-based multi-spec GEMV dispatch
 - `swamp-tools/src/bin/benchmark_prefill.rs` — benchmark harness

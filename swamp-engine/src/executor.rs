@@ -407,45 +407,21 @@ impl ModelExecutor {
             dspark.load_draft_cache(&draft_path);
             let mut draft_observations = dspark.draft_model.len;
 
-            // M:N Scheduler — GPU stream manager + persistent K/V buffers
-            #[cfg(feature = "gpu")]
+            // GPU acceleration via GpuComputeContext (runtime-fallback)
             let mut per_layer_gpu: Option<crate::scheduler::PerLayerGpuState> = {
                 let window_size = 4096usize.min(model.config.context_len.max(4096));
-                let upload_stream = swamp_gpu::gpu_stream_create().ok();
-                let (d_qw, d_kw, d_vw, d_ow, d_gw, d_uw, d_dw) = match upload_stream {
-                    Some(us) => {
-                        use crate::scheduler::PerLayerGpuState;
-                        let u = |name: &str| -> *mut u8 {
-                            let (off, len) = model.gguf.tensor_raw_offset_len(name).unwrap_or((0,0));
-                            if len == 0 { return std::ptr::null_mut(); }
-                            let (mp, _) = model.gguf.mmap_ptr_and_len();
-                            let h_ptr = unsafe { mp.add(off) as *const u8 };
-                            PerLayerGpuState::upload_weight(h_ptr, len, us).unwrap_or(std::ptr::null_mut())
-                        };
-                        // Upload all layers' weights
-                        let d_qw: Vec<*mut u8> = (0..num_layers).map(|l| u(&format!("blk.{l}.attn_q.weight"))).collect();
-                        let d_kw: Vec<*mut u8> = (0..num_layers).map(|l| u(&format!("blk.{l}.attn_k.weight"))).collect();
-                        let d_vw: Vec<*mut u8> = (0..num_layers).map(|l| u(&format!("blk.{l}.attn_v.weight"))).collect();
-                        let d_ow: Vec<*mut u8> = (0..num_layers).map(|l| u(&format!("blk.{l}.attn_output.weight"))).collect();
-                        let d_gw: Vec<*mut u8> = (0..num_layers).map(|l| u(&format!("blk.{l}.ffn_gate.weight"))).collect();
-                        let d_uw: Vec<*mut u8> = (0..num_layers).map(|l| u(&format!("blk.{l}.ffn_up.weight"))).collect();
-                        let d_dw: Vec<*mut u8> = (0..num_layers).map(|l| u(&format!("blk.{l}.ffn_down.weight"))).collect();
-                        let _ = swamp_gpu::gpu_stream_synchronize(us);
-                        let _ = swamp_gpu::gpu_stream_destroy(us);
-                        (d_qw, d_kw, d_vw, d_ow, d_gw, d_uw, d_dw)
-                    }
-                    None => (vec![], vec![], vec![], vec![], vec![], vec![], vec![]),
-                };
-                use crate::scheduler::PerLayerGpuState;
-                let d_gemv_x: *mut f32 = unsafe { swamp_gpu::gpu_alloc(ffn_dim.max(embed_dim) * 4) }.ok().map_or(std::ptr::null_mut(), |p| p as *mut f32);
-                let d_gemv_out: *mut f32 = unsafe { swamp_gpu::gpu_alloc(ffn_dim.max(embed_dim) * 4) }.ok().map_or(std::ptr::null_mut(), |p| p as *mut f32);
-                PerLayerGpuState::new(
+                let rms_eps = 1e-5_f32;
+                let mut pgs = crate::scheduler::PerLayerGpuState::new(
                     window_size, num_heads, num_kv_heads, head_dim, num_layers,
-                    d_qw, d_kw, d_vw, d_ow, d_gw, d_uw, d_dw,
-                    d_gemv_x, d_gemv_out,
-                    embed_dim.max(ffn_dim) as i32,
-                    embed_dim.max(ffn_dim).max(num_heads * head_dim) as i32,
-                )
+                    embed_dim, ffn_dim, rms_eps,
+                    vec![], vec![], vec![], vec![], vec![], vec![], vec![],
+                    std::ptr::null_mut(), std::ptr::null_mut(), 0, 0,
+                );
+                if let Some(ref mut gpu) = pgs {
+                    gpu.upload_all_weights(&model);
+                    gpu.upload_norm_weights(&attn_norms, &ffn_norms);
+                }
+                pgs
             };
 
             // PrefetchEngine for madvise-based page prefetch
@@ -584,6 +560,18 @@ impl ModelExecutor {
                     };
 
                     // Forward Pass: Camadas (group-aware for weight sharing)
+                    // Fused GPU path: async graph replay per layer, no sync until end if all fused
+                    #[cfg(feature = "gpu")]
+                    let mut fused_all_ok = per_layer_gpu.is_some();
+                    #[cfg(not(feature = "gpu"))]
+                    let mut fused_all_ok = false;
+                    if fused_all_ok {
+                        #[cfg(feature = "gpu")]
+                        if let Some(ref mut gpu) = per_layer_gpu {
+                            gpu.upload_x(&x);
+                        }
+                    }
+
                     for group in &model.shared_groups {
                         // Load shared tensor metadata once per group
                         let first = group[0];
@@ -606,6 +594,32 @@ impl ModelExecutor {
                             #[cfg(not(feature = "gpu"))]
                             let mut layer_profile = profiler.begin_layer(l, false);
 
+                            // Fused GPU layer graph: async replay on stream (no sync unless CPU fallback)
+                            #[cfg(feature = "gpu")]
+                            let layer_fused_ok: bool = if fused_all_ok {
+                                let ok = per_layer_gpu.as_mut().map_or(false, |gpu| {
+                                    let _ = gpu.create_layer_graph(l, embed_dim, ffn_dim);
+                                    gpu.execute_layer_fused(l, pos)
+                                });
+                                if !ok { fused_all_ok = false; }
+                                ok
+                            } else { false };
+                            #[cfg(not(feature = "gpu"))]
+                            let layer_fused_ok = false;
+                            if layer_fused_ok {
+                                profiler.end_layer(layer_profile);
+                                continue;
+                            }
+                            // First CPU-fallback layer: sync compute stream and download d_x to host x
+                            #[cfg(feature = "gpu")]
+                            if !fused_all_ok {
+                                if let Some(ref mut gpu) = per_layer_gpu {
+                                    gpu.sync();
+                                    gpu.download_x(&mut x);
+                                }
+                                fused_all_ok = false;
+                            }
+
                             // RMSNorm Attn
                             rmsnorm(&mut x_norm, &x, &attn_norms[l], rms_eps);
 
@@ -617,9 +631,9 @@ impl ModelExecutor {
                                         let n_blocks = q_t.shape[0] / 256;
                                         let ok = gpu.gemv_qkv_async(
                                             l,
-                                            gpu.d_q_weight.get(l).copied().unwrap_or(std::ptr::null_mut()),
-                                            gpu.d_k_weight.get(l).copied().unwrap_or(std::ptr::null_mut()),
-                                            gpu.d_v_weight.get(l).copied().unwrap_or(std::ptr::null_mut()),
+                                            std::ptr::null_mut(),
+                                            std::ptr::null_mut(),
+                                            std::ptr::null_mut(),
                                             &x_norm, &mut q, &mut k, &mut v,
                                             q_t.shape[1] as i32,
                                             k_t.shape[1] as i32,
@@ -717,7 +731,7 @@ impl ModelExecutor {
                                     per_layer_gpu.as_mut().map_or(false, |gpu| {
                                         let ok = gpu.execute_gemv_async(
                                             l,
-                                            gpu.d_o_weight.get(l).copied().unwrap_or(std::ptr::null_mut()),
+                                            std::ptr::null_mut(),
                                             &attn_out, &mut wo_out,
                                             o_t.shape[1] as i32,
                                             (o_t.shape[0] / 256) as i32,
@@ -744,8 +758,8 @@ impl ModelExecutor {
                                         let n_blocks = gate_t.shape[0] / 256;
                                         let ok = gpu.gemv_gate_up_async(
                                             l,
-                                            gpu.d_gate_weight.get(l).copied().unwrap_or(std::ptr::null_mut()),
-                                            gpu.d_up_weight.get(l).copied().unwrap_or(std::ptr::null_mut()),
+                                            std::ptr::null_mut(),
+                                            std::ptr::null_mut(),
                                             &x_norm, &mut ffn_gate, &mut ffn_up,
                                             gate_t.shape[1] as i32,
                                             n_blocks as i32,
@@ -776,7 +790,7 @@ impl ModelExecutor {
                                     per_layer_gpu.as_mut().map_or(false, |gpu| {
                                         let ok = gpu.execute_gemv_async(
                                             l,
-                                            gpu.d_down_weight.get(l).copied().unwrap_or(std::ptr::null_mut()),
+                                            std::ptr::null_mut(),
                                             &ffn_gate, &mut ffn_down,
                                             down_t.shape[1] as i32,
                                             (down_t.shape[0] / 256) as i32,
@@ -815,6 +829,15 @@ impl ModelExecutor {
                             }
 
                             profiler.end_layer(layer_profile);
+                        }
+                    }
+
+                    // If all layers used fused graph: sync + download final x to host
+                    #[cfg(feature = "gpu")]
+                    if fused_all_ok {
+                        if let Some(ref mut gpu) = per_layer_gpu {
+                            gpu.sync();
+                            gpu.download_x(&mut x);
                         }
                     }
 

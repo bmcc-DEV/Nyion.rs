@@ -273,8 +273,11 @@ impl SwampVm {
         let model = &slot.model;
         let cfg = &model.config;
         let head_dim = cfg.embed_dim / cfg.num_heads;
+        let ffn_dim = model.gguf.tensor_or_err("blk.0.ffn_gate.weight")
+            .map(|t| t.shape[1] as usize).unwrap_or(cfg.embed_dim * 4);
         let state = crate::scheduler::PerLayerGpuState::new(
             4096, cfg.num_heads, cfg.num_kv_heads, head_dim, cfg.num_layers,
+            cfg.embed_dim, ffn_dim, 1e-5_f32,
             vec![], vec![], vec![], vec![], vec![], vec![], vec![],
             std::ptr::null_mut(), std::ptr::null_mut(),
             0, 0,
@@ -413,9 +416,9 @@ impl SwampVm {
 
                 let n_blocks = q_t.shape[0] / 256;
                 let qkv_ok = gpu.gemv_qkv_async(l,
-                    gpu.d_q_weight.get(l).copied().unwrap_or(std::ptr::null_mut()),
-                    gpu.d_k_weight.get(l).copied().unwrap_or(std::ptr::null_mut()),
-                    gpu.d_v_weight.get(l).copied().unwrap_or(std::ptr::null_mut()),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
                     &ctx.x_norm, &mut ctx.q, &mut ctx.k, &mut ctx.v,
                     q_t.shape[1] as i32, k_t.shape[1] as i32, v_t.shape[1] as i32,
                     n_blocks as i32,
@@ -440,7 +443,7 @@ impl SwampVm {
                 }
 
                 let o_ok = gpu.execute_gemv_async(l,
-                    gpu.d_o_weight.get(l).copied().unwrap_or(std::ptr::null_mut()),
+                    std::ptr::null_mut(),
                     &ctx.attn_out, &mut ctx.wo_out,
                     o_t.shape[1] as i32, (o_t.shape[0] / 256) as i32,
                 ) && gpu.sync();
@@ -453,8 +456,8 @@ impl SwampVm {
 
                 let n_blocks_gu = gate_t.shape[0] / 256;
                 let gu_ok = gpu.gemv_gate_up_async(l,
-                    gpu.d_gate_weight.get(l).copied().unwrap_or(std::ptr::null_mut()),
-                    gpu.d_up_weight.get(l).copied().unwrap_or(std::ptr::null_mut()),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
                     &ctx.x_norm, &mut ctx.ffn_gate, &mut ctx.ffn_up,
                     gate_t.shape[1] as i32, n_blocks_gu as i32,
                 ) && gpu.sync();
@@ -467,7 +470,7 @@ impl SwampVm {
                 mul_in_place(&mut ctx.ffn_gate, &ctx.ffn_up);
 
                 let down_ok = gpu.execute_gemv_async(l,
-                    gpu.d_down_weight.get(l).copied().unwrap_or(std::ptr::null_mut()),
+                    std::ptr::null_mut(),
                     &ctx.ffn_gate, &mut ctx.ffn_down,
                     down_t.shape[1] as i32, (down_t.shape[0] / 256) as i32,
                 ) && gpu.sync();
