@@ -6,7 +6,6 @@
 
 pub struct VirtualExpertPrefetcher {
     num_experts: usize,
-    ffn_rows: usize,
     expert_row_ranges: Vec<(usize, usize)>,
     last_predicted: Option<usize>,
     hits: u64,
@@ -28,7 +27,6 @@ impl VirtualExpertPrefetcher {
         }
         Self {
             num_experts,
-            ffn_rows,
             expert_row_ranges,
             last_predicted: None,
             hits: 0,

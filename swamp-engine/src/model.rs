@@ -4,7 +4,6 @@
 use swamp_gguf::GgufFile;
 use std::path::Path;
 use anyhow::{Result, Context, anyhow};
-use std::sync::OnceLock;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 
 pub struct ModelConfig {
@@ -30,9 +29,6 @@ pub struct RingView {
     pub gate_off: usize, pub gate_nr: usize, pub gate_nc: usize, pub gate_bs: usize,
     pub up_off: usize,   pub up_nr: usize,   pub up_nc: usize,   pub up_bs: usize,
     pub down_off: usize, pub down_nr: usize, pub down_nc: usize, pub down_bs: usize,
-    // Pre-computed row strides
-    q_row_stride: usize, k_row_stride: usize, v_row_stride: usize, o_row_stride: usize,
-    gate_row_stride: usize, up_row_stride: usize, down_row_stride: usize,
 }
 
 fn block_size_for_dtype(dtype: swamp_gguf::GgmlDType) -> usize {
@@ -65,7 +61,7 @@ fn build_layer_ring(gguf: &GgufFile, layer: usize) -> Result<RingView> {
 
     let mut ring = Vec::new();
     let mut offsets = Vec::with_capacity(7);
-    for (nr, nc, bs, data) in &meta {
+    for (_nr, _nc, _bs, data) in &meta {
         offsets.push(ring.len());
         ring.extend_from_slice(data);
     }
@@ -81,13 +77,6 @@ fn build_layer_ring(gguf: &GgufFile, layer: usize) -> Result<RingView> {
         gate_off: offsets[4], gate_nr: meta[4].0, gate_nc: meta[4].1, gate_bs: meta[4].2,
         up_off: offsets[5],   up_nr: meta[5].0,   up_nc: meta[5].1,   up_bs: meta[5].2,
         down_off: offsets[6], down_nr: meta[6].0, down_nc: meta[6].1, down_bs: meta[6].2,
-        q_row_stride: (meta[0].1 / 256) * meta[0].2,
-        k_row_stride: (meta[1].1 / 256) * meta[1].2,
-        v_row_stride: (meta[2].1 / 256) * meta[2].2,
-        o_row_stride: (meta[3].1 / 256) * meta[3].2,
-        gate_row_stride: (meta[4].1 / 256) * meta[4].2,
-        up_row_stride: (meta[5].1 / 256) * meta[5].2,
-        down_row_stride: (meta[6].1 / 256) * meta[6].2,
     })
 }
 

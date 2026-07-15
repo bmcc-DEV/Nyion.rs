@@ -28,8 +28,6 @@ pub struct ModelSwapper {
     swap_log: VecDeque<SwapEvent>,
     /// Pipeline hint: próximo modelo que será necessário
     predicted_next: Option<String>,
-    /// Prefetch está ativo?
-    prefetch_active: bool,
 }
 
 impl ModelSwapper {
@@ -40,7 +38,6 @@ impl ModelSwapper {
             vram_capacity: vram_capacity_bytes,
             swap_log: VecDeque::with_capacity(32),
             predicted_next: None,
-            prefetch_active: false,
         }
     }
 

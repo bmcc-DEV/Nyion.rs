@@ -232,10 +232,6 @@ impl PagedKVCache {
         panic!("flat page id {} out of range (total {})", flat_id, self.total_pages);
     }
 
-    fn block_size_for_zone(&self, zi: usize) -> usize {
-        self.zones[zi].block_size
-    }
-
     pub fn block_size_for(&self, pos: usize) -> usize {
         ZONE_BLOCK_SIZES[self.zone_index(pos)]
     }

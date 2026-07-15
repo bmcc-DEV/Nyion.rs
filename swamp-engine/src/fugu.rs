@@ -145,14 +145,14 @@ impl FuguOrchestrator {
                 self.sparse_window
             };
             let dspark_blocks = if state.dspark_accept_rate > 0.0 && state.seq_len > 2048 {
-                16
+                self.n_heads.clamp(4, 64)
             } else {
                 0
             };
             if dspark_blocks > 0 {
                 AttentionStrategy::SparseWithDSPark {
                     window,
-                    sentinel_stride: 64,
+                    sentinel_stride: self.head_dim,
                     num_dspark: dspark_blocks,
                 }
             } else {
@@ -179,7 +179,12 @@ impl FuguOrchestrator {
         // Só ativa especulação se a taxa de aceitação for razoável
         let rate = self.accept_rate();
         if rate > 0.3 {
-            SpeculationStrategy::Enabled(2)
+            let k = self.speculation_window.load(Ordering::Relaxed) as usize;
+            if k > 0 {
+                SpeculationStrategy::Enabled(k)
+            } else {
+                SpeculationStrategy::Disabled
+            }
         } else {
             SpeculationStrategy::Disabled
         }
@@ -319,7 +324,7 @@ mod tests {
             predictive_throttle: false,
         };
         let strat = fugu.decide(&state);
-        assert_eq!(strat.speculation, SpeculationStrategy::Enabled(2));
+        assert_eq!(strat.speculation, SpeculationStrategy::Enabled(32));
     }
 
     #[test]

@@ -125,7 +125,7 @@ impl PerLayerGpuState {
         let device = match self.device.as_ref() { Some(d) => d, None => return false };
         if !device.enabled { return false; }
 
-        let (d_q, d_k, d_v, d_scores, d_attn, staging_buf) = {
+        let (_d_q, _d_k, _d_v, _d_scores, d_attn, _staging_buf) = {
             let ctx = match self.ctx.as_mut() { Some(c) => c, None => return false };
             let scratch = match ctx.scratch.as_ref() { Some(s) => s, None => return false };
             let kv = match ctx.kv_cache.as_ref() { Some(k) => k, None => return false };
@@ -169,7 +169,7 @@ impl PerLayerGpuState {
     }
 
     pub fn sync(&self) -> bool {
-        match self.ctx.as_ref() { Some(c) => {
+        match self.ctx.as_ref() { Some(_c) => {
             let device = match self.device.as_ref() { Some(d) => d, None => return false };
             device.compute_graph.lock().unwrap().wait().is_ok()
         }, None => false }
@@ -324,17 +324,12 @@ fn copy_host(s: &mut PerLayerGpuState, src: &[f32]) -> Option<vk::Buffer> {
     Some(buf)
 }
 
-fn copy_to_gpu(s: &mut PerLayerGpuState, staging: vk::Buffer, dst: vk::Buffer, size: u64) -> bool {
-    let ctx = match s.ctx.as_mut() { Some(c) => c, None => return false };
-    ctx.copy_between(staging, dst, 0, 0, size)
-}
-
 fn copy_from_gpu(s: &mut PerLayerGpuState, src: vk::Buffer, staging: vk::Buffer, size: u64) -> bool {
     let ctx = match s.ctx.as_mut() { Some(c) => c, None => return false };
     ctx.copy_between(src, staging, 0, 0, size)
 }
 
-fn readback_f32(s: &mut PerLayerGpuState, staging: vk::Buffer, dst: &mut [f32], count: usize) -> bool {
+fn readback_f32(s: &mut PerLayerGpuState, _staging: vk::Buffer, dst: &mut [f32], count: usize) -> bool {
     let ctx = match s.ctx.as_mut() { Some(c) => c, None => return false };
     let stg = match ctx.staging.as_ref() { Some(st) => st, None => return false };
     let len = count.min(dst.len());

@@ -364,30 +364,6 @@ pub fn forward_linear_batch(
 }
 
 // =========================================================================
-// Block dequantization — matches scalar path exactly
-// =========================================================================
-
-fn deq_q4k(blk: &[u8], dst: &mut [f32]) {
-    let d  = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
-    let dm = half::f16::from_le_bytes([blk[2], blk[3]]).to_f32();
-    let mut sc = [0u8; 8]; let mut mn = [0u8; 8];
-    for j in 0..4 { sc[j] = blk[4+j] & 63; mn[j] = blk[8+j] & 63; }
-    for j in 4..8 { let k=j+4; sc[j]=(blk[k]&0xF)|((blk[j-4]>>6)<<4); mn[j]=(blk[k]>>4)|((blk[j]>>6)<<4); }
-    for sb in 0..8 {
-        let sv = d * (sc[sb] as f32);
-        let mv = dm * (mn[sb] as f32);
-        let doff = sb * 32;
-        let qo = 16 + sb * 16;
-        for i in 0..16 {
-            let ql = (blk[qo + i] & 0x0F) as f32;
-            let qh = ((blk[qo + i] >> 4) & 0x0F) as f32;
-            dst[doff + i * 2]     = sv * ql - mv;
-            dst[doff + i * 2 + 1] = sv * qh - mv;
-        }
-    }
-}
-
-// =========================================================================
 // Batched Layer GEMV — all tensors in one parallel section
 // =========================================================================
 
