@@ -22,10 +22,6 @@ struct Args {
     pipeline: usize,
 }
 
-fn dummy_tokens(n: usize) -> Vec<usize> {
-    (0..n).map(|i| 1usize + (i % 100)).collect()
-}
-
 fn main() -> Result<()> {
     let args = Args::parse();
     swamp_engine::tokenizer::init_tokenizer(&args.tokenizer);
@@ -121,7 +117,7 @@ fn main() -> Result<()> {
                 });
             });
 
-            while let Some(msg) = rx2.blocking_recv() {
+            while let Some(_msg) = rx2.blocking_recv() {
                 // consume output
             }
             handle2.join().unwrap();

@@ -109,7 +109,7 @@ impl DataPlane {
                         _ => MemoryLocation::HostPinned,
                     };
                     let mut tensor = TensorHandle::new(location, dtype, shape);
-                    let mut hma_guard = hma.lock();
+                    let hma_guard = hma.lock();
                     tensor.allocate(&hma_guard);
                     drop(hma_guard);
                     let dev_handle = tensor.allocation.as_ref()
@@ -163,7 +163,7 @@ impl DataPlane {
                         _ => MemoryLocation::HostPinned,
                     };
                     let mut tensor = TensorHandle::new(location, dtype, shape);
-                    let mut hma_guard = hma.lock();
+                    let hma_guard = hma.lock();
                     tensor.allocate(&hma_guard);
                     drop(hma_guard);
                     let dev_handle = tensor.allocation.as_ref()
@@ -239,7 +239,7 @@ fn resolve_buf(id: u64, hs: &OpaqueHandleStore, _ctx: &GpuComputeContext) -> Opt
     match resource {
         OpaqueResource::Tensor { device_handle, .. } => {
             if device_handle == 0 { return None; }
-            Some(unsafe { vk::Buffer::from_raw(device_handle) })
+            Some(vk::Buffer::from_raw(device_handle))
         }
         _ => None,
     }

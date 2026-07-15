@@ -4,6 +4,7 @@ use tracing::info;
 
 type SparseAttentionFn = unsafe extern "C" fn(u64, u64, u64, u64, u64, i32, i32, i32, i32, i32);
 
+#[allow(dead_code)]
 pub struct MojoKernel {
     lib: Option<Library>,
     sparse_attention: Option<SparseAttentionFn>,

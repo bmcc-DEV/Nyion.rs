@@ -104,7 +104,7 @@ impl VkBackend {
         let (physical_device, queue_family) = physical_devices
             .iter()
             .filter_map(|&pd| {
-                let props = unsafe { instance.get_physical_device_properties(pd) };
+                let _props = unsafe { instance.get_physical_device_properties(pd) };
                 let queue_families = unsafe {
                     instance.get_physical_device_queue_family_properties(pd)
                 };

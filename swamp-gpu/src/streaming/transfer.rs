@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::vulkan::VkBackend;
-use super::triple_buffer::{TripleBuffer, BufferSlotState};
+use super::triple_buffer::TripleBuffer;
 use super::StreamTelemetry;
 
 pub struct TransferEngine {

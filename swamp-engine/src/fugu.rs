@@ -78,8 +78,10 @@ pub struct SystemSnapshot {
 
 pub struct FuguOrchestrator {
     // Constantes do modelo
+    #[allow(dead_code)]
     n_layers: usize,
     n_heads: usize,
+    #[allow(dead_code)]
     n_kv_heads: usize,
     head_dim: usize,
 

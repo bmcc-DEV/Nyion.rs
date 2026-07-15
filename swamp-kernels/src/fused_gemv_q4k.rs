@@ -901,7 +901,7 @@ mod tests {
 use std::os::raw::{c_float, c_int};
 
 #[no_mangle]
-pub extern "C" fn swamp_fused_gemv_q4k(
+pub unsafe extern "C" fn swamp_fused_gemv_q4k(
     w_raw_ptr: *const u8,
     x_ptr:     *const c_float,
     out_ptr:   *mut c_float,

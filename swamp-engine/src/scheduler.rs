@@ -17,7 +17,9 @@ pub struct PerLayerGpuState {
     num_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
+    #[allow(dead_code)]
     embed_dim: usize,
+    #[allow(dead_code)]
     ffn_dim: usize,
     /// Rastreia quais layers ja tem pesos carregados no GPU
     layer_loaded: Vec<bool>,

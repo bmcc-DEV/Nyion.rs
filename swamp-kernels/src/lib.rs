@@ -53,7 +53,7 @@ pub extern "C" fn mojo_stokes_free(cache_ptr: *mut c_void) {
 }
 
 #[no_mangle]
-pub extern "C" fn mojo_stokes_append(
+pub unsafe extern "C" fn mojo_stokes_append(
     cache_ptr: *mut c_void,
     _token_id: c_int,
     key_ptr: *const c_float,
@@ -179,7 +179,7 @@ unsafe fn softmax_padic_avx512_kernel(logits: &[i32], probs: &mut [i32]) -> i32 
 }
 
 #[no_mangle]
-pub extern "C" fn mojo_softmax_padic(
+pub unsafe extern "C" fn mojo_softmax_padic(
     logits: *const c_float,
     probs: *mut c_float,
     n: c_int,
@@ -232,7 +232,7 @@ pub extern "C" fn mojo_softmax_padic(
 // Fallback AVX2: _mm256_dpbssd_epi32 (32 MACs) ou escalar.
 
 #[no_mangle]
-pub extern "C" fn mojo_matmul_w3(
+pub unsafe extern "C" fn mojo_matmul_w3(
     a_ptr: *const c_float,
     w_ptr: *const c_char,
     c_ptr: *mut c_float,
@@ -450,7 +450,7 @@ fn matmul_w3_scalar(
 // Saida: dot product escalar f32 (apos colapso do Quire i32).
 
 #[no_mangle]
-pub extern "C" fn swamp_gemv_q8_vnni(
+pub unsafe extern "C" fn swamp_gemv_q8_vnni(
     weights: *const c_char,
     activations: *const c_char,
     k: c_int,

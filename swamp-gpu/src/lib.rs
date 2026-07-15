@@ -69,7 +69,7 @@ impl GpuDevice {
 
     pub fn submit_graph(&self) -> bool {
         if !self.enabled { return false; }
-        let mut cg = self.compute_graph.lock().unwrap();
+        let cg = self.compute_graph.lock().unwrap();
         cg.submit().is_ok()
     }
 
@@ -141,7 +141,7 @@ impl DeviceAllocator for GpuDevice {
 
     fn free(&self, alloc: &Allocation) {
         if let Some(handle) = alloc.device_handle {
-            let buffer = unsafe { vk::Buffer::from_raw(handle) };
+            let buffer = vk::Buffer::from_raw(handle);
             unsafe { self.backend.device.destroy_buffer(buffer, None); }
         }
     }

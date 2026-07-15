@@ -353,16 +353,15 @@ impl ModelExecutor {
                 let freq = crate::thermal::read_freq_khz() as f64;
                 (freq / max_freq_khz as f64).clamp(0.0, 1.0)
             };
-            let mut n_threads = 6;
-            // Initial thread count from thermal state
+            let mut n_threads;
             {
                 let t = temp_celsius;
                 let ce = c_epsilon;
-                if t > 85.0 { n_threads = 1; }
-                else if ce > 0.86 { n_threads = 6; }
-                else if ce > 0.7 { n_threads = 4; }
-                else if t > 78.0 { n_threads = 2; }
-                else { n_threads = 6; }
+                n_threads = if t > 85.0 { 1 }
+                else if ce > 0.86 { 6 }
+                else if ce > 0.7 { 4 }
+                else if t > 78.0 { 2 }
+                else { 6 };
             }
 
             // Local PolicyEngine for hot-reload inside the blocking thread
@@ -894,7 +893,7 @@ impl ModelExecutor {
 
                     // Amostragem (só depois de preencher o cache com o prompt)
                     if step >= prompt_tokens.len() - 1 {
-                        let mut next_token = sampler.sample(&logits);
+                        let next_token = sampler.sample(&logits);
 
                         // Speculative decoding: DSPark draft → reject if matches sampled token
                         let draft_result = dspark.draft_model.draft(&x);
@@ -998,7 +997,7 @@ impl ModelExecutor {
         requests: Vec<InferenceRequest>,
         max_concurrency: usize,
     ) -> Vec<anyhow::Result<String>> {
-        use std::sync::{mpsc, Arc, Mutex};
+        use std::sync::{Arc, Mutex};
         use std::thread;
 
         let n = requests.len();
@@ -1016,7 +1015,7 @@ impl ModelExecutor {
         for _ in 0..max_concurrency.min(n) {
             let jq = job_queue.clone();
             let res = results.clone();
-            let errs = errors.clone();
+            let _errs = errors.clone();
             let model = self.model.clone();
             let token_embd = self.token_embd.clone();
             let attn_norms = self.attn_norms.clone();

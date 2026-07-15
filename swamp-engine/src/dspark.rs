@@ -585,7 +585,7 @@ mod tests {
     fn test_pattern_draft_basic() {
         let embed_dim = 64;
         let mut draft = PatternDraft::new(embed_dim, 16, 128, 3);
-        let h = vec![0.5f32; embed_dim];
+        let _h = vec![0.5f32; embed_dim];
 
         // Observa uma sequencia de estados + tokens
         for i in 0..20 {
