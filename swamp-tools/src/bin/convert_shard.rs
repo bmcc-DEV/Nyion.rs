@@ -166,12 +166,8 @@ fn main() -> Result<()> {
     fs::write(&index_path, &index_json)
         .with_context(|| format!("escrevendo {}", index_path.display()))?;
 
-    println!();
-    println!("=== Conversao completa ===");
-    println!("  shard.bin:  {:.2} MB", shard_size as f64 / 1_048_576.0);
-    println!("  index.json: {} bytes", index_json.len());
-    println!();
     // QAT calibration: reload model, run calibration with dummy activations, rewrite shard
+    let (mut final_shard_size, mut final_index_json) = (shard_size, index_json);
     if cli.qat {
         println!();
         println!("=== QAT Calibration ===");
@@ -278,12 +274,14 @@ fn main() -> Result<()> {
         fs::write(&index_path, &index_json_qat)
             .with_context(|| format!("escrevendo {} (QAT)", index_path.display()))?;
         println!("  shard.bin (QAT): {:.2} MB", shard_size_qat as f64 / 1_048_576.0);
+        final_shard_size = shard_size_qat;
+        final_index_json = index_json_qat;
     }
 
     println!();
     println!("=== Conversao completa ===");
-    println!("  shard.bin:  {:.2} MB", shard_size as f64 / 1_048_576.0);
-    println!("  index.json: {} bytes", index_json.len());
+    println!("  shard.bin:  {:.2} MB", final_shard_size as f64 / 1_048_576.0);
+    println!("  index.json: {} bytes", final_index_json.len());
     println!();
     println!("  Para testar o streaming:");
     println!("    cargo run --release -p swamp-tools --bin swamp-benchmark-streaming -- \\");
