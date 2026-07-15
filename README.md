@@ -293,9 +293,3 @@ cargo run --release --features gpu -p swamp-tools --bin swamp-benchmark-prefill 
                      │  CPU / GPU / Cog     │
                      └──────────────────────┘
 ```
-
----
-
-## Licença
-
-MIT
