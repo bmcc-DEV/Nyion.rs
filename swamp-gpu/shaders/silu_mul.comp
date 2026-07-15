@@ -11,7 +11,7 @@ layout(push_constant) uniform PushConstants {
 
 layout(set = 0, binding = 0) buffer GateBuf { float gate[]; };
 layout(set = 0, binding = 1) buffer UpBuf { float up[]; };
-layout(set = 0, binding = 2) buffer OutBuf { float out[]; };
+layout(set = 0, binding = 2) buffer OutBuf { float out_buf[]; };
 
 void main() {
     uint gid = gl_GlobalInvocationID.x;
@@ -20,5 +20,5 @@ void main() {
     float g = gate[gid];
     // SiLU: x * sigmoid(x)
     float sig = 1.0 / (1.0 + exp(-g));
-    out[gid] = g * sig * up[gid];
+    out_buf[gid] = g * sig * up[gid];
 }

@@ -43,8 +43,9 @@ float dequant_dot(uint block_offset, int dim) {
                   (uint(w_buf.weights[block_offset + 1]) << 8) |
                   (uint(w_buf.weights[block_offset + 2]) << 16) |
                   (uint(w_buf.weights[block_offset + 3]) << 24);
-    float d = uint16BitsToFloat(header & 0xFFFF);
-    float dmin = uint16BitsToFloat((header >> 16) & 0xFFFF);
+    vec2 halves = unpackHalf2x16(header);
+    float d = halves.x;
+    float dmin = halves.y;
 
     float result = 0.0;
     for (int i = 0; i < dim; i++) {

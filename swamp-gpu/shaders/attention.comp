@@ -1,5 +1,8 @@
 #version 460
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
 
 // FlashAttention-style kernel
 // Each workgroup handles one head
@@ -19,10 +22,11 @@ layout(set = 0, binding = 0) buffer QBuf { float q[]; };
 layout(set = 0, binding = 1) buffer KBuf { float k[]; };
 layout(set = 0, binding = 2) buffer VBuf { float v[]; };
 layout(set = 0, binding = 3) buffer ScoresBuf { float scores[]; };
-layout(set = 0, binding = 4) buffer OutBuf { float out[]; };
+layout(set = 0, binding = 4) buffer OutBuf { float out_buf[]; };
 
 shared float tile_k[64][64];  // tile of K
 shared float tile_v[64][64];  // tile of V
+shared float reduce_scratch[64];
 
 void main() {
     uint head = gl_WorkGroupID.x;
@@ -90,14 +94,20 @@ void main() {
             tile_d = exp(tile_scores[lid] - tile_max);
         }
 
-        // Warp-level reduction for tile_d
-        for (uint i = 16; i > 0; i >>= 1) {
-            tile_d += __shfl_xor_sync(0xFFFFFFFF, tile_d, i, 32);
+        // Reduction in shared memory for tile_d
+        reduce_scratch[lid] = (lid < tile_len) ? tile_d : 0.0;
+        barrier();
+        for (uint i = 32; i > 0; i >>= 1) {
+            if (lid < i && lid + i < 64) {
+                reduce_scratch[lid] += reduce_scratch[lid + i];
+            }
+            barrier();
         }
 
         if (lid == 0) {
+            float reduced_d = tile_len > 0 ? reduce_scratch[0] : 0.0;
             float new_m = max(m, tile_max);
-            d = d * exp(m - new_m) + tile_d * exp(tile_max - new_m);
+            d = d * exp(m - new_m) + reduced_d * exp(tile_max - new_m);
             m = new_m;
         }
         barrier();
@@ -116,6 +126,6 @@ void main() {
 
     // Write output
     for (uint d = lid; d < head_dim; d += 64) {
-        out[head * head_dim + d] = acc[d];
+        out_buf[head * head_dim + d] = acc[d];
     }
 }
