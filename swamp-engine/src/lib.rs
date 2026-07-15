@@ -26,6 +26,7 @@ pub mod power_arbiter;
 pub mod model_registry;
 pub mod model_swapper;
 pub mod governor;
+pub mod qat;
 pub mod swamp_vm;
 pub mod pipeline;
 pub mod streamer;

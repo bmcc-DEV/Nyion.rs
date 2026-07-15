@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use rand::Rng;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
@@ -154,8 +155,8 @@ fn main() -> Result<()> {
 
     let index = ShardIndex {
         format: "swamp-hyperstream-v1".to_string(),
-        model: model_name,
-        quant: cli.quant,
+        model: model_name.clone(),
+        quant: cli.quant.clone(),
         num_layers,
         layers,
     };
@@ -164,6 +165,120 @@ fn main() -> Result<()> {
         .context("serializando index.json")?;
     fs::write(&index_path, &index_json)
         .with_context(|| format!("escrevendo {}", index_path.display()))?;
+
+    println!();
+    println!("=== Conversao completa ===");
+    println!("  shard.bin:  {:.2} MB", shard_size as f64 / 1_048_576.0);
+    println!("  index.json: {} bytes", index_json.len());
+    println!();
+    // QAT calibration: reload model, run calibration with dummy activations, rewrite shard
+    if cli.qat {
+        println!();
+        println!("=== QAT Calibration ===");
+        let mut model = swamp_engine::model::Model::load(&cli.gguf_path)
+            .context("carregando modelo para QAT")?;
+        let calibrator = swamp_engine::qat::QatCalibrator::new(&model);
+
+        let num_layers = model.config.num_layers;
+        let mut rng = rand::thread_rng();
+        for l in 0..num_layers {
+            let ring = &model.layer_rings[l];
+            let tensor_info: [(usize, usize, usize); 7] = [
+                (0, ring.q_nr, ring.q_nc / 256),
+                (1, ring.k_nr, ring.k_nc / 256),
+                (2, ring.v_nr, ring.v_nc / 256),
+                (3, ring.o_nr, ring.o_nc / 256),
+                (4, ring.gate_nr, ring.gate_nc / 256),
+                (5, ring.up_nr,   ring.up_nc / 256),
+                (6, ring.down_nr, ring.down_nc / 256),
+            ];
+            for &(ti, n_rows, n_blocks_per_row) in &tensor_info {
+                for row in 0..n_rows {
+                    for bc in 0..n_blocks_per_row {
+                        let x_blk: Vec<f32> = (0..256).map(|_| rng.gen::<f32>() * 2.0 - 1.0).collect();
+                        let bi = swamp_engine::qat::QatCalibrator::block_idx(row, bc, n_blocks_per_row);
+                        calibrator.record_activation(l, ti, bi, &x_blk);
+                    }
+                }
+            }
+            if (l + 1) % 8 == 0 || l == num_layers - 1 {
+                println!("  Calibrando: layer {}/{}", l + 1, num_layers);
+            }
+        }
+
+        calibrator.apply_ring(&mut model)?;
+        println!("  QAT calibration aplicada");
+
+        // Rewrite shard with calibrated weights
+        let mut shard = fs::File::create(&shard_path)
+            .with_context(|| format!("recriando {} para QAT", shard_path.display()))?;
+
+        fn ring_slice_for<'a>(ring: &'a swamp_engine::model::RingView, short_name: &str) -> &'a [u8] {
+            match short_name {
+                "q"    => ring.q_slice(),
+                "k"    => ring.k_slice(),
+                "v"    => ring.v_slice(),
+                "o"    => ring.o_slice(),
+                "gate" => ring.gate_slice(),
+                "up"   => ring.up_slice(),
+                "down" => ring.down_slice(),
+                _      => panic!("unknown tensor short name: {}", short_name),
+            }
+        }
+
+        let mut layers_qat: Vec<LayerInfo> = Vec::with_capacity(num_layers as usize);
+        for l in 0..num_layers as usize {
+            let mut tensors = HashMap::new();
+            for &(short_name, gguf_pattern) in TENSOR_NAMES {
+                let gguf_name = gguf_tensor_name(l, gguf_pattern);
+                let raw = if let Ok(tensor) = gguf.tensor_or_err(&gguf_name) {
+                    if short_name == "attn_norm" || short_name == "ffn_norm" {
+                        gguf.tensor_raw_bytes(tensor)
+                            .with_context(|| format!("lendo {} bytes de {}", tensor.nbytes(), gguf_name))?
+                            .to_vec()
+                    } else {
+                        ring_slice_for(&model.layer_rings[l], short_name).to_vec()
+                    }
+                } else {
+                    eprintln!("  Aviso: tensor {} nao encontrado na layer {}", gguf_name, l);
+                    continue;
+                };
+                let offset = shard.stream_position()?;
+                shard.write_all(&raw)
+                    .with_context(|| format!("escrevendo {} (QAT)", gguf_name))?;
+                let n_blocks = 0u32;
+                tensors.insert(short_name.to_string(), TensorInfo {
+                    offset,
+                    size: raw.len() as u64,
+                    n_blocks,
+                });
+            }
+            layers_qat.push(LayerInfo {
+                id: l as u32,
+                name: format!("blk.{}", l),
+                tensors,
+            });
+            if (l + 1) % 8 == 0 || l == num_layers as usize - 1 {
+                println!("  Re-escrevendo (QAT): layer {}/{}", l + 1, num_layers);
+            }
+        }
+
+        let shard_size_qat = shard.stream_position()?;
+        drop(shard);
+
+        let index_qat = ShardIndex {
+            format: "swamp-hyperstream-v1".to_string(),
+            model: model_name.clone(),
+            quant: cli.quant.clone(),
+            num_layers: num_layers as u32,
+            layers: layers_qat,
+        };
+        let index_json_qat = serde_json::to_string_pretty(&index_qat)
+            .context("serializando index.json (QAT)")?;
+        fs::write(&index_path, &index_json_qat)
+            .with_context(|| format!("escrevendo {} (QAT)", index_path.display()))?;
+        println!("  shard.bin (QAT): {:.2} MB", shard_size_qat as f64 / 1_048_576.0);
+    }
 
     println!();
     println!("=== Conversao completa ===");

@@ -1577,6 +1577,7 @@ dependencies = [
  "anyhow",
  "clap",
  "half",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "swamp-engine",

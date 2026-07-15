@@ -7,9 +7,9 @@
 
 use crate::aimd::AimdRamp;
 use crate::power_arbiter::PowerArbiter;
-use crate::thermal::{ThermalLSC, read_package_temp_celsius, read_freq_khz};
-use crate::model_registry::{ModelRegistry, MemoryTier, ModelEntry};
-use crate::model_swapper::{ModelSwapper, SwapAction};
+use crate::thermal::ThermalLSC;
+use crate::model_registry::{ModelRegistry, MemoryTier};
+use crate::model_swapper::ModelSwapper;
 use std::time::{Duration, Instant};
 use std::sync::Arc;
 
@@ -87,7 +87,7 @@ impl ResourceGovernor {
     pub fn new(
         vram_bytes: usize,      // ex: GTX 1650 = 4_294_967_296
         max_n_threads: usize,
-        pl1_watts: f64,
+        _pl1_watts: f64,
     ) -> Self {
         let now = Instant::now();
         Self {
@@ -231,7 +231,7 @@ impl ResourceGovernor {
             || self.thermal.state == crate::thermal::ThermalState::Warning;
 
         // 2. AIMD ramp (dobra/corta budget)
-        self.total_budget = self.aimd.assess(stressed);
+        self.total_budget = self.aimd.assess(stressed, 1.0);
 
         // 3. PowerArbiter split (CPU vs iGPU)
         let (cpu_frac, _igpu_frac) = self.power.reassess(pl1_watts);

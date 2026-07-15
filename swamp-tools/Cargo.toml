@@ -44,5 +44,6 @@ anyhow = { workspace = true }
 clap   = { workspace = true }
 half   = { workspace = true }
 tokio  = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

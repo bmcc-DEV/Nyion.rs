@@ -435,6 +435,9 @@ impl ModelExecutor {
             let (mmap_ptr, mmap_len) = model.gguf.mmap_ptr_and_len();
             let prefetch_engine = crate::prefetch::PrefetchEngine::new(mmap_ptr, mmap_len);
 
+            // StreamTelemetry: tracks prefetch hit/miss for CPU path (mirrors GPU path stats)
+            let telemetry = swamp_gpu::streaming::StreamTelemetry::new();
+
             // AIMD Resource Ramp — dobra budget a cada 0.5s sem stress, corta metade no 1o sinal
             let mut aimd = crate::aimd::AimdRamp::new();
             // Prefetch window K (adaptativo, ajustado pelo AIMD via hit_rate)
@@ -542,7 +545,12 @@ impl ModelExecutor {
 
                         // Stress signals: temp > warning, freq droop, or low prefetch hit rate
                         let stressed = temp_celsius > 80.0 || c_epsilon < 0.85 || hit_rate < 0.6;
-                        let aimd_budget = aimd.assess(stressed);
+                        let aimd_budget = aimd.assess(stressed, hit_rate);
+
+                        // Extra K boost when prefetch quality is high for 5+ consecutive assessments
+                        if aimd.should_boost_k() {
+                            prefetch_k = prefetch_k.saturating_add(1).min(32);
+                        }
 
                         // Adaptive prefetch window K
                         let base_k = 6usize;
@@ -867,6 +875,7 @@ impl ModelExecutor {
                                     ] {
                                         if let Some((off, len)) = model.gguf.tensor_raw_offset_len(tensor_name) {
                                             prefetch_engine.prefetch_range(off, len);
+                                            telemetry.record_prefetch_miss();
                                         }
                                     }
                                 }
@@ -974,6 +983,11 @@ impl ModelExecutor {
                     let report = profiler.report();
                     let _ = tx.blocking_send(report);
                 }
+
+                // Telemetry CSV export (prefetch stats)
+                let _ = tx.blocking_send(format!("\n—— StreamTelemetry ——"));
+                let _ = tx.blocking_send(swamp_gpu::streaming::StreamTelemetry::snapshot_header().to_string());
+                let _ = tx.blocking_send(telemetry.snapshot_csv());
 
                 if elapsed > 0.0 {
                     let _ = tx.blocking_send(format!("\n\n[Tokens: {} | Throughput: {:.2} tok/s]", tokens_generated, tokens_generated as f64 / elapsed));

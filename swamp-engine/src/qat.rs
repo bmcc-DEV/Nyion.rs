@@ -34,7 +34,7 @@ impl QatCalibrator {
         let n_blocks_embed = embed_dim / 256;
         // Compute ffn_dim from the first layer's ring
         let n_blocks_ffn = if num_layers > 0 {
-            model.layer_rings[0].n_blocks_down
+            model.layer_rings[0].down_nc / 256
         } else { 1 };
 
         let layer_stats = (0..num_layers).map(|l| {
@@ -92,13 +92,13 @@ impl QatCalibrator {
                 (3, ring.o_off,   ring.gate_off, ring.o_nr,  self.n_blocks_embed),
                 (4, ring.gate_off, ring.up_off,  ring.gate_nr, self.n_blocks_embed),
                 (5, ring.up_off,  ring.down_off, ring.up_nr,  self.n_blocks_embed),
-                (6, ring.down_off, ring.data.len(), ring.down_nr, self.n_blocks_ffn),
+                (6, ring.down_off, ring.ring.len(), ring.down_nr, self.n_blocks_ffn),
             ];
 
             for &(ti, start_off, end_off, n_rows, n_blocks) in &tensors {
                 let ts = &tl[ti];
                 let row_bytes = n_blocks * 144;
-                let data = &mut ring.data[start_off..end_off];
+                let data = &mut ring.ring[start_off..end_off];
 
                 for row in 0..n_rows {
                     for bc in 0..n_blocks {
