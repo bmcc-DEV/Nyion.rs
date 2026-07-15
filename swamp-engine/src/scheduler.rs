@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use ash::vk;
 
 // ---------------------------------------------------------------------------
@@ -19,6 +19,13 @@ pub struct PerLayerGpuState {
     head_dim: usize,
     embed_dim: usize,
     ffn_dim: usize,
+    /// Rastreia quais layers ja tem pesos carregados no GPU
+    layer_loaded: Vec<bool>,
+    /// Contadores de prefetch para feedback AIMD
+    prefetch_hits: AtomicU64,
+    prefetch_misses: AtomicU64,
+    /// HyperStreamEngine para streaming de pesos via shard (opcional)
+    pub streamer: Option<super::streamer::HyperStreamEngine>,
 }
 
 unsafe impl Send for PerLayerGpuState {}
@@ -36,23 +43,55 @@ impl PerLayerGpuState {
         _max_gemv_cols: i32, _max_gemv_rows: i32,
     ) -> Option<Self> {
         let device = Arc::new(swamp_gpu::GpuDevice::new());
+        let loaded = vec![false; num_layers];
+        let hits = AtomicU64::new(0);
+        let misses = AtomicU64::new(0);
         if !device.enabled {
             return Some(Self { ctx: None, device: Some(device), enabled: false,
-                num_layers, window_size, num_heads, n_kv_heads, head_dim, embed_dim, ffn_dim });
+                num_layers, window_size, num_heads, n_kv_heads, head_dim, embed_dim, ffn_dim,
+                layer_loaded: loaded, prefetch_hits: hits, prefetch_misses: misses,
+                streamer: None });
         }
         let ctx = swamp_gpu::GpuComputeContext::new(
             &device, embed_dim, ffn_dim, num_heads, n_kv_heads, head_dim, window_size, num_layers,
         );
         if ctx.is_none() {
             return Some(Self { ctx: None, device: Some(device), enabled: false,
-                num_layers, window_size, num_heads, n_kv_heads, head_dim, embed_dim, ffn_dim });
+                num_layers, window_size, num_heads, n_kv_heads, head_dim, embed_dim, ffn_dim,
+                layer_loaded: loaded, prefetch_hits: hits, prefetch_misses: misses,
+                streamer: None });
         }
         Some(Self { ctx, device: Some(device), enabled: true,
-            num_layers, window_size, num_heads, n_kv_heads, head_dim, embed_dim, ffn_dim })
+            num_layers, window_size, num_heads, n_kv_heads, head_dim, embed_dim, ffn_dim,
+            layer_loaded: loaded, prefetch_hits: AtomicU64::new(0), prefetch_misses: AtomicU64::new(0),
+            streamer: None })
     }
 
     pub fn is_operational(&self) -> bool {
         self.enabled && self.ctx.is_some()
+    }
+
+    /// Inicializa HyperStreamEngine a partir de shard paths.
+    /// Chamado apos new() se as env vars SWAMP_SHARD_INDEX e SWAMP_SHARD_DATA estiverem setadas.
+    pub fn try_init_streamer<P: AsRef<std::path::Path>>(
+        &mut self,
+        index_path: P,
+        data_path: P,
+    ) {
+        let backend = match self.device.as_ref().filter(|d| d.enabled) {
+            Some(d) => &d.backend,
+            None => return,
+        };
+        let slot_size = 64 * 1024 * 1024; // 64MB default slot
+        match super::streamer::HyperStreamEngine::open(backend, index_path, data_path, slot_size) {
+            Ok(streamer) => {
+                self.streamer = Some(streamer);
+                tracing::info!("Nyion HyperStream engine initialized");
+            }
+            Err(e) => {
+                tracing::warn!("HyperStreamEngine falhou ao iniciar: {}", e);
+            }
+        }
     }
 
     pub fn upload_weight(_h_w: *const u8, _bytes: usize, _stream: swamp_gpu::CudaStream) -> Option<*mut u8> {
@@ -334,6 +373,10 @@ impl PerLayerGpuState {
         Some(Self {
             ctx: ctx_opt, device: Some(device.clone()), enabled,
             num_layers, window_size, num_heads, n_kv_heads, head_dim, embed_dim, ffn_dim,
+            layer_loaded: vec![false; num_layers],
+            prefetch_hits: AtomicU64::new(0),
+            prefetch_misses: AtomicU64::new(0),
+            streamer: None,
         })
     }
 
@@ -347,11 +390,82 @@ impl PerLayerGpuState {
                 l,
                 r.q_slice(), r.k_slice(), r.v_slice(),
                 r.o_slice(), r.gate_slice(), r.up_slice(), r.down_slice(),
-                &[], &[], // attn_norm and ffn_norm are uploaded separately
+                &[], &[],
             );
             if !ok { return false; }
+            if l < self.layer_loaded.len() { self.layer_loaded[l] = true; }
         }
         true
+    }
+
+    /// Carrega pesos de uma unica layer no GPU sob demanda.
+    /// Usa HyperStreamEngine (shard) se disponivel, ou RingView do model como fallback.
+    /// Retorna true se layer pronta (ja carregada ou acabou de carregar).
+    /// Incrementa contadores internos de hit/miss para feedback AIMD.
+    pub fn ensure_layer_loaded(&mut self, layer: usize, model: &crate::model::Model) -> bool {
+        let ctx = match self.ctx.as_mut() { Some(c) => c, None => return false };
+        if layer >= self.num_layers { return false; }
+        if layer < self.layer_loaded.len() && self.layer_loaded[layer] {
+            self.prefetch_hits.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+
+        let ok = if let Some(ref mut streamer) = self.streamer {
+            // HyperStream path: le dados do shard e faz upload via engine
+            Self::load_layer_from_streamer(ctx, layer, streamer)
+        } else if layer < model.layer_rings.len() {
+            // Fallback path: le dados do RingView (model GGUF mmap)
+            let r = &model.layer_rings[layer];
+            ctx.upload_layer_weights(
+                layer,
+                r.q_slice(), r.k_slice(), r.v_slice(),
+                r.o_slice(), r.gate_slice(), r.up_slice(), r.down_slice(),
+                &[], &[],
+            )
+        } else {
+            false
+        };
+
+        if ok && layer < self.layer_loaded.len() {
+            self.layer_loaded[layer] = true;
+        }
+        if !ok {
+            self.prefetch_misses.fetch_add(1, Ordering::Relaxed);
+        }
+        ok
+    }
+
+    /// Le os 7 tensores de peso de uma layer do shard via HyperStreamEngine
+    /// e faz upload para o GPU usando GpuComputeContext.
+    fn load_layer_from_streamer(
+        ctx: &mut swamp_gpu::GpuComputeContext,
+        layer: usize,
+        streamer: &mut super::streamer::HyperStreamEngine,
+    ) -> bool {
+        let mut bufs = Vec::with_capacity(7);
+        for &name in &["q", "k", "v", "o", "gate", "up", "down"] {
+            match streamer.read_tensor(layer, name) {
+                Some(data) => bufs.push(data.to_vec()),
+                None => {
+                    tracing::warn!("layer {} tensor {} ausente no shard", layer, name);
+                    return false;
+                }
+            }
+        }
+        ctx.upload_layer_weights(
+            layer,
+            &bufs[0], &bufs[1], &bufs[2],
+            &bufs[3], &bufs[4], &bufs[5], &bufs[6],
+            &[], &[],
+        )
+    }
+
+    /// Retorna (hits, misses) acumulados e reseta os contadores.
+    /// Usado pelo AIMD no executor para calcular hit_rate.
+    pub fn drain_prefetch_stats(&self) -> (u64, u64) {
+        let h = self.prefetch_hits.swap(0, Ordering::AcqRel);
+        let m = self.prefetch_misses.swap(0, Ordering::AcqRel);
+        (h, m)
     }
 
     fn staging_copy_to_device(&mut self, staging: vk::Buffer, dst: vk::Buffer, size: u64) -> bool {

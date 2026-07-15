@@ -5,24 +5,32 @@ edition = "2021"
 description = "LLamañón.rs - ferramentas CLI para inspecionar e manipular modelos GGUF"
 
 [[bin]]
-name = "swamp-inspect"
+name = "nyion-inspect"
 path = "src/bin/inspect.rs"
 
 [[bin]]
-name = "swamp-benchmark"
+name = "nyion-benchmark"
 path = "src/bin/benchmark.rs"
 
 [[bin]]
-name = "swamp-benchmark-fused"
+name = "nyion-benchmark-fused"
 path = "src/bin/benchmark_fused.rs"
 
 [[bin]]
-name = "swamp-benchmark-prefill"
+name = "nyion-benchmark-prefill"
 path = "src/bin/benchmark_prefill.rs"
 
 [[bin]]
-name = "benchmark-q4k-batched"
+name = "nyion-benchmark-q4k-batched"
 path = "src/bin/benchmark_q4k_batched.rs"
+
+[[bin]]
+name = "nyion-benchmark-streaming"
+path = "src/bin/benchmark_streaming.rs"
+
+[[bin]]
+name = "nyion-convert-shard"
+path = "src/bin/convert_shard.rs"
 
 [features]
 gpu = ["swamp-engine/gpu"]
@@ -36,3 +44,5 @@ anyhow = { workspace = true }
 clap   = { workspace = true }
 half   = { workspace = true }
 tokio  = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }

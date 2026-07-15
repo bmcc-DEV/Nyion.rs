@@ -8,8 +8,8 @@ use std::time::Instant;
 use swamp_gguf::GgufFile;
 
 #[derive(Parser)]
-#[command(name = "swamp-benchmark")]
-#[command(about = "Swamp - benchmark de dequantizacao de tensores")]
+#[command(name = "nyion-benchmark")]
+#[command(about = "Nyion - benchmark de dequantizacao de tensores")]
 struct Cli {
     model: String,
 

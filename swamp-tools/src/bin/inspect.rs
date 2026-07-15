@@ -6,8 +6,8 @@ use clap::Parser;
 use swamp_gguf::GgufFile;
 
 #[derive(Parser)]
-#[command(name = "swamp-inspect")]
-#[command(about = "Swamp - inspeciona modelos GGUF")]
+#[command(name = "nyion-inspect")]
+#[command(about = "Nyion - inspeciona modelos GGUF")]
 struct Cli {
     /// Caminho para o arquivo .gguf
     model: String,
@@ -35,7 +35,7 @@ fn main() -> Result<()> {
     let gguf = GgufFile::open(&cli.model)?;
 
     // Cabecalho
-    println!("=== Swamp - swamp-inspect ===");
+    println!("=== Nyion - inspect ===");
     println!("Arquivo:       {}", cli.model);
     println!("Arquitetura:   {}", gguf.architecture());
     println!("Tensores:      {}", gguf.n_tensors());

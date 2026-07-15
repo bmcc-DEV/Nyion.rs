@@ -1,4 +1,4 @@
-# Swamp — Mapa Mental
+# Nyion — Mapa Mental
 
 > Inferência de LLM em Rust + Vulkan para GTX 1650 4GB + CPU AVX-512.
 > Branch: `experimental-1m` — github.com/bmcc-DEV/swamp
@@ -60,7 +60,7 @@ O nome bonito ("organismo vivo") não justifica reimplementar em Forth o que já
 │    ├── Executor: generate/generate_batch, decode loop      │
 │    ├── Scheduler: GPU streams, graphs, PerLayerGpuState    │
 │    ├── Governor: AIMD + Power + Registry + Swapper + LSC   │
-│    ├── SwampVM: ring MPSC + CPU/GPU/Cognitive backends     │
+│    ├── NyionVM: ring MPSC + CPU/GPU/Cognitive backends     │
 │    ├── Pipeline: 7-stage multi-model graph                 │
 │    ├── DSPark: speculative decoding (LSH pattern draft)    │
 │    └── +20 modules (ops, cache, sampler, policy, etc.)     │
@@ -97,7 +97,7 @@ O nome bonito ("organismo vivo") não justifica reimplementar em Forth o que já
           ┌────────────────────┼────────────────────┐
           │                    │                    │
   ┌───────▼───────┐   ┌───────▼───────┐   ┌───────▼───────┐
-  │  SwampVM      │   │  Governor     │   │  Pipeline     │
+  │  NyionVM      │   │  Governor     │   │  Pipeline     │
   │ (opcode ring) │   │ (admissão)    │   │ (multi-model) │
   │ CPU/GPU/Cog   │   │ auto-tune     │   │ 7 stages      │
   └───────┬───────┘   └───────┬───────┘   └───────┬───────┘
@@ -194,7 +194,7 @@ per-op GPU (GEMV graph async) → CPU kernel (RoPE, RMSNorm, SiLU, Add)
            └───────────┴───────────┴───────────┴───────────┘
                                ▼
                     ┌──────────────────────┐
-                    │  SwampVM dispatcher  │
+                    │  NyionVM dispatcher  │
                     │  CPU / GPU / Cog     │
                     └──────────────────────┘
 ```
@@ -241,7 +241,7 @@ per-op GPU (GEMV graph async) → CPU kernel (RoPE, RMSNorm, SiLU, Add)
 
 | Módulo | Função |
 |--------|--------|
-| **swamp_vm.rs** | SwampVM: ring MPSC + CPU/GPU/Cognitive backends + SessionContext |
+| **swamp_vm.rs** | NyionVM: ring MPSC + CPU/GPU/Cognitive backends + SessionContext |
 | **vnpu.rs** | VirtualNpuScheduler: EWMA budget tracking |
 | **pipeline.rs** | Multi-model pipeline: Qwen, DeepSeek, GLM, Phi, SmolVLM, Llama 4, GLM-4.5 |
 
@@ -276,7 +276,7 @@ per-op GPU (GEMV graph async) → CPU kernel (RoPE, RMSNorm, SiLU, Add)
 | `gpu_alloc_buffers/free_buffers` | Scratch buffers |
 | `gpu_attention_forward/device/streamed` | Attention (f32 + half) |
 | `gpu_gemv_q4k/full/prealloc` | GEMV (sync + async) |
-| `gpu_swamp_init/launch/enqueue/readback/shutdown` | Swamp continuum |
+| `gpu_swamp_init/launch/enqueue/readback/shutdown` | Nyion continuum |
 | `LayerGraph` create/replay/destroy | Fused layer graph |
 | `GemvGraph` create/replay/destroy | GEMV graphs (QKV, GateUp, Single) |
 | `AttentionGraph` create/replay/destroy | Attention graph cache |

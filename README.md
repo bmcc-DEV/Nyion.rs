@@ -1,4 +1,4 @@
-# Swamp — LLM Inference Engine
+# Nyion — LLM Inference Engine
 
 > Inferência de LLM em Rust + Vulkan, targeting GPU NVIDIA GTX 1650 4GB + CPU AVX-512 Tiger Lake.  
 > Arquitetura **Control/Data Plane**: LuaJIT orquestra, Rust + Vulkan executam.
@@ -36,7 +36,7 @@
 
 | Crate | Função | Tecnologia |
 |-------|--------|------------|
-| **swamp-engine** | Core inference: executor, scheduler, policy, thermal, SwampVM | Rust + LuaJIT |
+| **nyion-engine** | Core inference: executor, scheduler, policy, thermal, NyionVM | Rust + LuaJIT |
 | **swamp-gpu** | GPU backend: Vulkan, ComputeGraph DAG, Mojo loader | Vulkan + Mojo + GLSL |
 | **swamp-kernels** | CPU SIMD kernels: Q4_K/Q6_K GEMV, Stokes KV cache, softmax | Rust (VNNI/AVX2/scalar) |
 | **swamp-gguf** | GGUF parser + lazy dequantization, zero-copy mmap | Rust |
@@ -241,7 +241,7 @@ cargo run --release --features gpu -p swamp-tools --bin swamp-benchmark-prefill 
 | **Cache** | `cache.rs` | PagedKV Cache 3-tier (Hot FP32+Q4 / Cold NVMe) |
 | **Fugu** | `fugu.rs` | Strategy orchestrator (attention, GEMV, cache, speculation) |
 | **DSPark** | `dspark.rs` | LSH speculative decoding |
-| **SwampVM** | `swamp_vm.rs` | Persistent opcode dispatcher (CPU/GPU/Cognitive) |
+| **NyionVM** | `swamp_vm.rs` | Persistent opcode dispatcher (CPU/GPU/Cognitive) |
 | **Governor** | `governor.rs` | ResourceGovernor: AIMD + PowerArbiter + Registry + Swapper |
 | **Thermal** | `thermal.rs` | RAPL telemetry + throttle prediction |
 | **Pipeline** | `pipeline.rs` | 7-stage multi-model pipeline |
@@ -289,7 +289,7 @@ cargo run --release --features gpu -p swamp-tools --bin swamp-benchmark-prefill 
            └───────────┴───────────┴───────────┴───────────┘
                                 ▼
                      ┌──────────────────────┐
-                     │  SwampVM dispatcher  │
+                     │  NyionVM dispatcher  │
                      │  CPU / GPU / Cog     │
                      └──────────────────────┘
 ```

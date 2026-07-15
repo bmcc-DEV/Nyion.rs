@@ -418,7 +418,15 @@ impl ModelExecutor {
                     std::ptr::null_mut(), std::ptr::null_mut(), 0, 0,
                 );
                 if let Some(ref mut gpu) = pgs {
-                    gpu.upload_all_weights(&model);
+                    // Tenta inicializar HyperStreamEngine via env vars
+                    if let (Ok(idx), Ok(data)) = (
+                        std::env::var("SWAMP_SHARD_INDEX"),
+                        std::env::var("SWAMP_SHARD_DATA"),
+                    ) {
+                        gpu.try_init_streamer(&idx, &data);
+                    }
+                    // Streaming: nao carrega todos os pesos upfront
+                    // ensure_layer_loaded() carrega sob demanda no decode loop
                     gpu.upload_norm_weights(&attn_norms, &ffn_norms);
                 }
                 pgs
@@ -430,6 +438,8 @@ impl ModelExecutor {
 
             // AIMD Resource Ramp — dobra budget a cada 0.5s sem stress, corta metade no 1o sinal
             let mut aimd = crate::aimd::AimdRamp::new();
+            // Prefetch window K (adaptativo, ajustado pelo AIMD via hit_rate)
+            let mut prefetch_k: usize = 3;
 
             // PowerArbiter — divide budget entre CPU threads e iGPU por RAPL+temp
             let mut arbiter = crate::power_arbiter::PowerArbiter::new();
@@ -522,9 +532,22 @@ impl ModelExecutor {
                         let freq = crate::thermal::read_freq_khz() as f64;
                         c_epsilon = (freq / max_freq_khz as f64).clamp(0.0, 1.0);
 
-                        // Stress signals: temp > warning, freq droop, or RAPL power > 80W
-                        let stressed = temp_celsius > 80.0 || c_epsilon < 0.85;
-                        let _aimd_budget = aimd.assess(stressed);
+                        // Prefetch statistics from PerLayerGpuState
+                        #[cfg(feature = "gpu")]
+                        let (pf_hits, pf_misses) = per_layer_gpu.as_ref()
+                            .map(|g| g.drain_prefetch_stats()).unwrap_or((0, 0));
+                        #[cfg(not(feature = "gpu"))]
+                        let (pf_hits, pf_misses) = (0, 0);
+                        let pf_total = pf_hits + pf_misses;
+                        let hit_rate = if pf_total > 0 { pf_hits as f64 / pf_total as f64 } else { 1.0 };
+
+                        // Stress signals: temp > warning, freq droop, or low prefetch hit rate
+                        let stressed = temp_celsius > 80.0 || c_epsilon < 0.85 || hit_rate < 0.6;
+                        let aimd_budget = aimd.assess(stressed);
+
+                        // Adaptive prefetch window K
+                        let base_k = 6usize;
+                        prefetch_k = aimd.scaled_k(base_k);
 
                         // PowerArbiter split: CPU vs iGPU
                         let (cpu_frac, _igpu_frac) = arbiter.reassess(55.0);
@@ -533,6 +556,11 @@ impl ModelExecutor {
                         let base_threads = if !stressed { 6 } else { 2 };
                         n_threads = aimd.scaled_threads(base_threads);
                         n_threads = (n_threads as f64 * cpu_frac).round().max(1.0) as usize;
+
+                        tracing::info!(
+                            "AIMD: budget={:.2} K={} hit_rate={:.2} stressed={}",
+                            aimd_budget, prefetch_k, hit_rate, stressed,
+                        );
                     }
 
                     // AIMD stress signal for Fugu (predictive throttle)
@@ -624,6 +652,10 @@ impl ModelExecutor {
                             rmsnorm(&mut x_norm, &x, &attn_norms[l], rms_eps);
 
                             // QKV Projections FUNDIDAS (shared weight across group)
+                            #[cfg(feature = "gpu")]
+                            if let Some(ref mut g) = per_layer_gpu {
+                                g.ensure_layer_loaded(l, &model);
+                            }
                             let gemv_qkv_ok: bool = {
                                 #[cfg(feature = "gpu")]
                                 {
@@ -805,6 +837,19 @@ impl ModelExecutor {
                                 forward_linear(&model.gguf, down_t, &ffn_gate, &mut ffn_down, n_threads)?;
                             }
                             add_in_place(&mut x, &ffn_down);
+
+                            // Streaming GPU prefetch: carrega pesos das proximas K layers
+                            #[cfg(feature = "gpu")]
+                            {
+                                if let Some(ref mut gpu) = per_layer_gpu {
+                                    for ahead in 1..=prefetch_k {
+                                        let next = l + ahead;
+                                        if next < num_layers {
+                                            gpu.ensure_layer_loaded(next, &model);
+                                        }
+                                    }
+                                }
+                            }
 
                             // Prefetch next group's first layer tensors (madvise WILLNEED)
                             // Only prefetch if next layer is in a different group (different weights)

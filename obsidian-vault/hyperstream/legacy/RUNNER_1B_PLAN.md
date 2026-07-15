@@ -7,7 +7,7 @@ tags:
 created: 2026-07-07
 ---
 
-# Plano de Refatoração: SwampLLM Runner 1B
+# Plano de Refatoração: NyionLLM Runner 1B
 
 **Meta:** 1B parâmetros Q4_K, 5–10M contexto, >150 tk/s no i5-11260H + GTX 1650 4GB
 
@@ -30,7 +30,7 @@ created: 2026-07-07
 | KV cache hot em FP32 | 64 KB/token — só cabe ~375K tokens em 24GB RAM | Sem tier Q4 em páginas quentes |
 | DSPark: n-gram puro, draft=target | Ganho zero em texto criativo | Falta padrão cognitivo no embedding space |
 | Cold storage: append-only sem GC | Arquivo cresce até encher o disco | Sem circular buffer |
-| GPU só faz attention, nunca GEMV | GPU subutilizada (4GB VRAM ociosa) | Swamp Continuum não integrado ao executor |
+| GPU só faz attention, nunca GEMV | GPU subutilizada (4GB VRAM ociosa) | Nyion Continuum não integrado ao executor |
 | `ensure_pages_hot` roda a cada token | I/O síncrono mesmo quando GPU está ativa | Corrigido parcialmente, mas sem prefetch adaptativo |
 | `PagedKVCache` com block_size=32 fixo | 5M tokens = 156K páginas → overhead LRU enorme | Block size adaptativo |
 
@@ -139,7 +139,7 @@ created: 2026-07-07
 **Duração:** Semanas 3–4
 **Ganho esperado:** 1.5–2× no decode
 
-### 2.1 — Swamp Continuum no executor (GEMV GPU)
+### 2.1 — Nyion Continuum no executor (GEMV GPU)
 
 - **Arquivos:** `swamp-engine/src/executor.rs`, `swamp-gpu/src/lib.rs`
 - **Ação:** Integrar `gpu_swamp_enqueue()` para dispatcar GEMVs Q4_K dos **primeiros 4 layers** (mais quentes) para GPU. Restante fica na CPU. O kernel persistente `swamp_continuum` já suporta GEMV no CUDA
@@ -233,7 +233,7 @@ created: 2026-07-07
 
 ```mermaid
 gantt
-    title SwampLLM Runner 1B — Roadmap
+    title NyionLLM Runner 1B — Roadmap
     dateFormat  YYYY-MM-DD
     axisFormat  %b %d
 
@@ -249,7 +249,7 @@ gantt
     Logit caching                    :f1_3, after f1_2, 2d
 
     section Fase 2: GPU Pipeline
-    Swamp Continuum GEMV GPU         :f2_1, after f1_3, 4d
+    Nyion Continuum GEMV GPU         :f2_1, after f1_3, 4d
     KV FP16 residente VRAM           :f2_2, after f2_1, 3d
     Overlap CPU+GPU                  :f2_3, after f2_2, 2d
 
@@ -306,7 +306,7 @@ gantt
 - `swamp-engine/src/prefetch.rs` — estender para KV cache
 
 ### Fase 2
-- `swamp-gpu/src/lib.rs` — bridge Swamp Continuum
+- `swamp-gpu/src/lib.rs` — bridge Nyion Continuum
 - `swamp-engine/src/executor.rs` — pipeline GPU
 - `swamp-engine/src/scheduler.rs` — overlap CPU+GPU
 - `swamp-gpu/kernels/fused_attention.cu` — kernel persistente
@@ -327,6 +327,6 @@ gantt
 
 - [[VNPU_CONCEPT.md]] — Conceito de virtualização de clock/threads/cache/NPU
 - `AGENTS.md` — Comandos de build e benchmark
-- `swamp-gpu/kernels/fused_attention.cu` — Kernel CUDA Swamp Continuum
+- `swamp-gpu/kernels/fused_attention.cu` — Kernel CUDA Nyion Continuum
 - `swamp-engine/src/vnpu.rs` — VirtualNpuScheduler
 - `swamp-engine/src/cache.rs` — PagedKVCache

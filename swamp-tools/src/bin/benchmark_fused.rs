@@ -17,7 +17,7 @@ use swamp_gguf::GgufFile;
 use swamp_engine::forward_linear;
 
 #[derive(Parser)]
-#[command(name = "swamp-benchmark-fused")]
+#[command(name = "nyion-benchmark-fused")]
 #[command(about = "Benchmark do Fused GEMV Q4_K (zero RAM write de F32)")]
 struct Cli {
     model: String,

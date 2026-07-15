@@ -6,7 +6,7 @@ use swamp_engine::Model;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "swamp-benchmark-prefill")]
+#[command(name = "nyion-benchmark-prefill")]
 struct Args {
     model: String,
     tokenizer: String,

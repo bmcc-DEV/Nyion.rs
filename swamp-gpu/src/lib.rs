@@ -2,6 +2,7 @@ pub mod vulkan;
 pub mod compute_graph;
 pub mod shaders;
 pub mod mojo;
+pub mod streaming;
 
 use std::sync::Arc;
 use ash::vk;

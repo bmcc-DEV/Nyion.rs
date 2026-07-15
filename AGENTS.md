@@ -25,6 +25,19 @@ Options:
 - `--qat` — enable QAT calibration before decode
 - `--repeats N` — benchmark repeat count
 
+## Nyion HyperStream — Shard Converter
+```bash
+cargo run --release -p swamp-tools --bin swamp-convert-shard -- \
+  --gguf model.gguf --output-dir ./shards/
+```
+
+## Nyion HyperStream — Streaming Benchmark
+```bash
+cargo run --release -p swamp-tools --bin swamp-benchmark-streaming -- \
+  ./shards/index.json ./shards/shard.bin \
+  --layer-id 0 --tensor-slot 0 --repeats 100 --prefetch-k 3
+```
+
 ## Power tuning (may help reduce AVX-512 downclock)
 ```bash
 sudo modprobe msr && sudo wrmsr -a 0x1FC 0x4004005f
@@ -56,5 +69,9 @@ One CUDA Graph captures the entire transformer layer: RMSNorm → QKV → RoPE �
 - `swamp-gpu/src/lib.rs` — Rust FFI for `LayerGraph` and all GPU functions
 - `swamp-engine/src/scheduler.rs` — `PerLayerGpuState` with fused graph management
 - `swamp-engine/src/executor.rs` — decode loop with fused graph path
+- `swamp-engine/src/streamer.rs` — `HyperStreamEngine` (streaming orchestrator)
 - `swamp-kernels/src/fused_gemv_q4k.rs` — VNNI/AVX2/scalar GEMV kernels
 - `swamp-tools/src/bin/benchmark_prefill.rs` — benchmark harness
+- `swamp-tools/src/bin/convert_shard.rs` — GGUF → shard.bin converter
+- `swamp-tools/src/bin/benchmark_streaming.rs` — streaming throughput benchmark
+- `obsidian-vault/hyperstream/` — HyperStream design docs and backlog

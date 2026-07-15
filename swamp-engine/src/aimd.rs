@@ -74,4 +74,11 @@ impl AimdRamp {
     pub fn cycles(&self) -> u64 { self.cycles }
     pub fn halvings(&self) -> u64 { self.halvings }
     pub fn just_stressed(&self) -> bool { self.stressed }
+
+    /// Scale streaming prefetch window K based on AIMD budget.
+    /// High budget → more aggressive prefetch, low budget → conservative.
+    pub fn scaled_k(&self, base_k: usize) -> usize {
+        let k = (base_k as f64 * self.budget.sqrt()).round() as usize;
+        k.max(1).min(base_k.saturating_mul(2))
+    }
 }

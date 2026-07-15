@@ -1,5 +1,5 @@
 // swamp-tensors - lib.rs
-// Swamp - Tipos de tensor e operacoes CPU
+// Nyion - Tipos de tensor e operacoes CPU
 
 pub mod layout;
 pub mod tensor;

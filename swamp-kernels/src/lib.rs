@@ -1,5 +1,5 @@
 // swamp-kernels/src/lib.rs
-// Swamp - swamp-kernels: kernels SIMD de alto desempenho
+// Nyion - kernels SIMD de alto desempenho
 //
 // Contem:
 //   - Stokes KV Cache (gerenciamento de contexto)

@@ -114,9 +114,9 @@ impl PolicyEngine {
                     .unwrap_or(0);
                 if modified_ns > self.last_load_ns.load(Ordering::Acquire) {
                     if let Err(e) = self.reload() {
-                        eprintln!("[swamp] Policy reload failed: {}", e);
+                        eprintln!("[nyion] Policy reload failed: {}", e);
                     } else {
-                        println!("[swamp] Policy hot-reloaded: {}", self.script_path);
+                        println!("[nyion] Policy hot-reloaded: {}", self.script_path);
                     }
                 }
             }
@@ -144,7 +144,7 @@ impl PolicyEngine {
                 match f.call::<i64>((c_epsilon, temp_celsius, freq_mhz as i64)) {
                     Ok(n) => (n.max(1).min(6)) as usize,
                     Err(e) => {
-                        eprintln!("[swamp] Lua adapt_threads error: {}", e);
+                        eprintln!("[nyion] Lua adapt_threads error: {}", e);
                         self.fallback_threads
                     }
                 }
@@ -161,7 +161,7 @@ impl PolicyEngine {
                 match f.call::<bool>((layer_idx as i64, temp_celsius)) {
                     Ok(skip) => skip,
                     Err(e) => {
-                        eprintln!("[swamp] Lua should_skip_layer error: {}", e);
+                        eprintln!("[nyion] Lua should_skip_layer error: {}", e);
                         false
                     }
                 }
@@ -182,7 +182,7 @@ impl PolicyEngine {
                 match f.call::<i64>((context_tokens as i64, temp_celsius)) {
                     Ok(n) => (n.max(8).min(2048)) as usize,
                     Err(e) => {
-                        eprintln!("[swamp] Lua suggest_batch_size error: {}", e);
+                        eprintln!("[nyion] Lua suggest_batch_size error: {}", e);
                         512
                     }
                 }

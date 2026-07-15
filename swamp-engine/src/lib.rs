@@ -28,6 +28,7 @@ pub mod model_swapper;
 pub mod governor;
 pub mod swamp_vm;
 pub mod pipeline;
+pub mod streamer;
 pub mod control_plane;
 pub mod data_plane;
 

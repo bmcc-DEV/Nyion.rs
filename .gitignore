@@ -1,3 +1,7 @@
 target/
+venv/
 *.gguf
 *.safetensors
+shard.bin
+index.json
+shards/

@@ -864,7 +864,7 @@ void gpu_event_destroy(cudaEvent_t event) {
 // out: [n_rows] f32 output
 // ---------------------------------------------------------------------------
 __global__ void kernel_gemv_q4k(
-    const uint8_t* __restrict__ w,       // Q4_K weights in VRAM
+    const uint8_t* __restrict__ w,       // Q4_K weights in VRAM, column-major layout
     const float*   __restrict__ x,       // activation vector
     float*         __restrict__ out,     // output vector
     int n_rows,
@@ -872,22 +872,18 @@ __global__ void kernel_gemv_q4k(
     float scale_x,
     float inv_scale_x
 ) {
-    // x is pre-quantized to i8 on host, stored as f32 for simplicity
-    // Each thread processes 1 row
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= n_rows) return;
 
     float total = 0.0f;
     for (int blk = 0; blk < n_blocks; blk++) {
-        const uint8_t* blk_ptr = w + ((size_t)row * n_blocks + blk) * 144;
-        
-        // Load d/dmin as f16
+        const uint8_t* blk_ptr = w + ((size_t)blk * n_rows + row) * 144;
+
         half d_h = *reinterpret_cast<const half*>(blk_ptr);
         half dmin_h = *reinterpret_cast<const half*>(blk_ptr + 2);
         float d = __half2float(d_h);
         float dmin = __half2float(dmin_h);
-        
-        // Unpack scales (12 bytes → 8+8)
+
         float scales[8], mins[8];
         #pragma unroll
         for (int j = 0; j < 4; j++) {
@@ -899,20 +895,17 @@ __global__ void kernel_gemv_q4k(
             scales[j] = (blk_ptr[8 + j] & 0xF) | ((blk_ptr[4 + j - 4] >> 6) << 4);
             mins[j]   = (blk_ptr[8 + j] >> 4) | ((blk_ptr[4 + j] >> 6) << 4);
         }
-        
-        // Process 8 sub-blocks of 32 values each
+
         const uint8_t* qs = blk_ptr + 16;
         float dot = 0.0f;
-        float dot_corr = 0.0f;
-        
+
+        #pragma unroll
         for (int sb = 0; sb < 8; sb++) {
-            float sum_x = 0.0f;
             #pragma unroll
             for (int k = 0; k < 32; k++) {
                 int nib = (qs[sb * 16 + k / 2] >> ((k % 2) * 4)) & 0x0F;
-                float w_val = d * (nib - 8) * scales[sb] + dmin * mins[sb];
                 float xk = x[blk * 256 + sb * 32 + k];
-                dot += w_val * xk;
+                dot += (d * (nib - 8) * scales[sb] + dmin * mins[sb]) * xk;
             }
         }
         total += dot;
@@ -930,7 +923,34 @@ void gpu_gemv_q4k(
     kernel_gemv_q4k<<<blocks, threads, 0, stream>>>(d_w, d_x, d_out, n_rows, n_blocks, 0.0f, 0.0f);
 }
 
-// Upload weights to GPU (ring buffer)
+// Transpose Q4_K weights from row-major to column-major at the super-block level.
+// Row-major (old): each row's n_blocks super-blocks are contiguous.
+// Column-major (new): each column-block's n_rows super-blocks are contiguous.
+// This gives stride=144 between adjacent threads instead of stride=n_blocks*144.
+static void transpose_weights_q4k(const uint8_t* src, uint8_t* dst, int n_rows, int n_blocks) {
+    for (int blk = 0; blk < n_blocks; blk++) {
+        for (int row = 0; row < n_rows; row++) {
+            const uint8_t* s = src + ((size_t)row * n_blocks + blk) * 144;
+            uint8_t* d = dst + ((size_t)blk * n_rows + row) * 144;
+            memcpy(d, s, 144);
+        }
+    }
+}
+
+// Upload weights with transpose: converts row-major → column-major layout
+void gpu_upload_weights_transposed(
+    const uint8_t* h_w, uint8_t** d_w,
+    size_t bytes, int n_rows, int n_blocks,
+    cudaStream_t stream
+) {
+    uint8_t* h_transposed = (uint8_t*)malloc(bytes);
+    transpose_weights_q4k(h_w, h_transposed, n_rows, n_blocks);
+    cudaMalloc(d_w, bytes);
+    cudaMemcpyAsync(*d_w, h_transposed, bytes, cudaMemcpyHostToDevice, stream);
+    free(h_transposed);
+}
+
+// Upload weights to GPU (ring buffer, original row-major layout)
 void gpu_upload_weights(const uint8_t* h_w, uint8_t** d_w, size_t bytes, cudaStream_t stream) {
     cudaMalloc(d_w, bytes);
     cudaMemcpyAsync(*d_w, h_w, bytes, cudaMemcpyHostToDevice, stream);
@@ -984,6 +1004,70 @@ void gpu_free_buffers(float* d_x, float* d_out) {
     cudaFree(d_x);
     cudaFree(d_out);
 }
+
+// ---------------------------------------------------------------------------
+// Microbenchmark: time a single GEMV kernel in isolation (no graph, no copy)
+// Returns kernel execution time in microseconds via a parameter.
+// ---------------------------------------------------------------------------
+void gpu_gemv_q4k_timed(
+    const uint8_t* d_w, const float* d_x, float* d_out,
+    int n_rows, int n_blocks,
+    cudaStream_t stream,
+    float* out_elapsed_us
+) {
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    int threads = 256;
+    int blocks = (n_rows + threads - 1) / threads;
+
+    cudaEventRecord(start, stream);
+    kernel_gemv_q4k<<<blocks, threads, 0, stream>>>(d_w, d_x, d_out, n_rows, n_blocks, 0.0f, 0.0f);
+    cudaEventRecord(stop, stream);
+    cudaEventSynchronize(stop);
+
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, start, stop);
+    *out_elapsed_us = ms * 1000.0f;
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+}
+
+// Microbenchmark for the full fused layer graph
+void gpu_layer_graph_timed(
+    void* graph_exec,
+    int* d_wpos, int* d_seq_len, int pos, int window_size,
+    cudaStream_t stream,
+    float* out_elapsed_us
+) {
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    int wpos = pos % window_size;
+    int seq_len = pos + 1;
+    cudaError_t err;
+    err = cudaMemcpyAsync(d_wpos, &wpos, sizeof(int), cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess) { fprintf(stderr, "[probe] ERR d_wpos: %s\n", cudaGetErrorString(err)); *out_elapsed_us = -1.0f; cudaEventDestroy(start); cudaEventDestroy(stop); return; }
+    err = cudaMemcpyAsync(d_seq_len, &seq_len, sizeof(int), cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess) { fprintf(stderr, "[probe] ERR d_seq_len: %s\n", cudaGetErrorString(err)); *out_elapsed_us = -1.0f; cudaEventDestroy(start); cudaEventDestroy(stop); return; }
+
+    cudaEventRecord(start, stream);
+    cudaGraphExec_t layer_exec = *(cudaGraphExec_t*)graph_exec;
+    err = cudaGraphLaunch(layer_exec, stream);
+    if (err != cudaSuccess) { fprintf(stderr, "[probe] ERR cudaGraphLaunch: %s\n", cudaGetErrorString(err)); *out_elapsed_us = -2.0f; cudaEventDestroy(start); cudaEventDestroy(stop); return; }
+    cudaEventRecord(stop, stream);
+    cudaEventSynchronize(stop);
+
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, start, stop);
+    *out_elapsed_us = ms * 1000.0f;
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+}
 // ===========================================================================
 // Swamp Continuum: meta-kernel CUDA persistente
 // Lê opcodes de um ring buffer em device memory. Nunca retorna.
@@ -1033,7 +1117,7 @@ __device__ void exec_gemv_q4k(
 
     float total = 0.0f;
     for (int blk = 0; blk < n_blocks; blk++) {
-        const uint8_t* blk_ptr = w + ((size_t)row * n_blocks + blk) * 144;
+        const uint8_t* blk_ptr = w + ((size_t)blk * n_rows + row) * 144;
         half d_h = *reinterpret_cast<const half*>(blk_ptr);
         half dmin_h = *reinterpret_cast<const half*>(blk_ptr + 2);
         float d = __half2float(d_h);
@@ -1343,6 +1427,283 @@ void* gpu_graph_create_gemv_single(
     cudaGraphDestroy(graph);
     cudaStreamDestroy(stream);
     return (void*)graph_exec;
+}
+
+// =====================================================================
+// Fused Layer Graph kernels
+// =====================================================================
+
+// RoPE in-place on q and k (each head's pairs rotated by position-dependent angle)
+// pos = *d_seq_len - 1, read from device so it updates between graph replays
+__global__ void kernel_rope(float* q, float* k, int n_q_heads, int n_kv_heads, int head_dim, const int* d_seq_len) {
+    int pos = *d_seq_len - 1;
+    int half_dim = head_dim / 2;
+    int idx = blockIdx.x;
+    float* vec;
+    if (idx < n_q_heads) vec = q + idx * head_dim;
+    else if (idx < n_q_heads + n_kv_heads) vec = k + (idx - n_q_heads) * head_dim;
+    else return;
+
+    for (int j = threadIdx.x; j < half_dim; j += blockDim.x) {
+        float freq = 1.0f / powf(10000.0f, (2.0f * j) / head_dim);
+        float angle = pos * freq;
+        float c = cosf(angle);
+        float s = sinf(angle);
+        int i = j * 2;
+        float x = vec[i];
+        float y = vec[i + 1];
+        vec[i] = x * c - y * s;
+        vec[i + 1] = x * s + y * c;
+    }
+}
+
+// KV save: copy k,v to ring buffer (half precision)
+// wpos read from device pointer
+__global__ void kernel_kv_save(const float* k, const float* v, half* k_buf, half* v_buf,
+    int n_kv_heads, int head_dim, int window_size, const int* d_wpos)
+{
+    int wpos = *d_wpos;
+    int h = blockIdx.x;
+    int d = threadIdx.x;
+    if (h >= n_kv_heads || d >= head_dim) return;
+    size_t idx = ((size_t)h * window_size + wpos) * head_dim + d;
+    k_buf[idx] = __float2half(k[h * head_dim + d]);
+    v_buf[idx] = __float2half(v[h * head_dim + d]);
+}
+
+// add_in_place: x += y
+__global__ void kernel_add(float* x, const float* y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] += y[i];
+}
+
+// RMSNorm: out = x * rsqrt(mean(x^2) + eps) * w
+__global__ void kernel_rmsnorm(float* out, const float* x, const float* w, float eps, int n) {
+    extern __shared__ float sdata[];
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) ss += x[i] * x[i];
+    sdata[threadIdx.x] = ss;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float rms = rsqrtf(sdata[0] / n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) out[i] = x[i] * rms * w[i];
+}
+
+// Fused SiLU + Mul: gate *= sigmoid(gate) * up
+__global__ void kernel_silu_mul(float* gate, const float* up, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float g = gate[i];
+        gate[i] = (g / (1.0f + expf(-g))) * up[i];
+    }
+}
+
+// Attention kernels with seq_len from device pointer (for graph with variable seq_len)
+__global__ void kernel_scores_dptr(
+    const float* q, const half* k_cache, float* scores,
+    int n_heads, int n_kv_heads, int head_dim, int kv_stride, float scale, const int* d_seq_len
+) {
+    int seq_len = *d_seq_len;
+    int h = blockIdx.x;
+    int t = blockIdx.y;
+    if (h >= n_heads || t >= seq_len) return;
+    int kv_h = h * n_kv_heads / n_heads;
+    const float* q_row = q + h * head_dim;
+    const half* k_row = k_cache + ((size_t)kv_h * kv_stride + t) * head_dim;
+    float dot = 0.0f;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) dot += q_row[d] * (float)k_row[d];
+    for (int offset = warpSize / 2; offset > 0; offset /= 2) dot += __shfl_xor_sync(0xffffffff, dot, offset);
+    __shared__ float shared[32];
+    int warp_id = threadIdx.x / warpSize;
+    int lane = threadIdx.x % warpSize;
+    if (lane == 0) shared[warp_id] = dot;
+    __syncthreads();
+    if (warp_id == 0) {
+        dot = (threadIdx.x < blockDim.x / warpSize) ? shared[threadIdx.x] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset /= 2) dot += __shfl_xor_sync(0xffffffff, dot, offset);
+        if (threadIdx.x == 0) scores[h * seq_len + t] = dot * scale;
+    }
+}
+
+__global__ void kernel_softmax_v_dptr(
+    const float* scores, const half* v_cache, float* output,
+    int n_heads, int n_kv_heads, int head_dim, int v_stride, const int* d_seq_len
+) {
+    int seq_len = *d_seq_len;
+    int h = blockIdx.x;
+    if (h >= n_heads) return;
+    int kv_h = h * n_kv_heads / n_heads;
+    int d = threadIdx.x;
+    extern __shared__ float sh_scores[];
+    auto g = cg::this_thread_block();
+    for (int t = d; t < seq_len; t += blockDim.x) sh_scores[t] = scores[h * seq_len + t];
+    g.sync();
+    float max_val = -1e10f;
+    for (int t = 0; t < seq_len; t++) max_val = fmaxf(max_val, sh_scores[t]);
+    float sum_exp = 0.0f;
+    for (int t = 0; t < seq_len; t++) sum_exp += __expf(sh_scores[t] - max_val);
+    float inv_sum = 1.0f / sum_exp;
+    float acc = 0.0f;
+    const half* v_base = v_cache + (size_t)kv_h * v_stride * head_dim;
+    for (int t = 0; t < seq_len; t++) {
+        float prob = __expf(sh_scores[t] - max_val) * inv_sum;
+        acc += prob * (float)v_base[t * head_dim + d];
+    }
+    output[h * head_dim + d] = acc;
+}
+
+// =====================================================================
+// Layer Graph Handle
+// =====================================================================
+
+typedef struct {
+    cudaGraphExec_t exec;
+    int* d_wpos;
+    int* d_seq_len;
+    float* d_scores;
+} LayerGraph;
+
+// Create a fused CUDA Graph for one layer: QKV → RoPE → KV save → Attention → O → add → RMSNorm → GateUp → SiLU+Mul → Down → add
+// All weight pointers and scratch buffers are FIXED at creation (per-layer).
+// Variable parameters (pos, seq_len) are passed via device pointers (d_wpos, d_seq_len).
+void* gpu_graph_create_layer(
+    // QKV weights (Q4_K device)
+    const uint8_t* d_w_q, const uint8_t* d_w_k, const uint8_t* d_w_v,
+    const uint8_t* d_w_o, const uint8_t* d_w_gate, const uint8_t* d_w_up, const uint8_t* d_w_down,
+    // Norm weights (device, f32)
+    const float* d_attn_norm, const float* d_ffn_norm,
+    // KV ring buffer (device, half)
+    half* d_k_buf, half* d_v_buf,
+    // State buffers (device, f32)
+    float* d_x, float* d_x_norm,
+    float* d_q_out, float* d_k_out, float* d_v_out,
+    float* d_attn_out, float* d_o_out,
+    float* d_gate_out, float* d_up_out, float* d_down_out,
+    // Scores buffer for attention (device, f32)
+    float* d_scores,
+    // Variable param pointers (device)
+    int* d_wpos, int* d_seq_len,
+    // Model config
+    int n_heads, int n_kv_heads, int head_dim, int window_size,
+    int embed_dim, int ffn_dim,
+    int n_rows_q, int n_rows_k, int n_rows_v, int n_rows_o,
+    int n_rows_gate_up, int n_rows_down,
+    int n_blocks_qkv_o_gate_up, int n_blocks_down,
+    float rms_eps
+) {
+    cudaStream_t stream;
+    if (cudaStreamCreate(&stream) != cudaSuccess) return NULL;
+
+    cudaGraph_t graph;
+    cudaGraphCreate(&graph, 0);
+
+    int embed_blocks = (embed_dim + 255) / 256;
+    int ffn_blocks_total = (ffn_dim + 255) / 256;
+    int sm_rms = embed_dim * sizeof(float);
+    int max_gemv_rows = max(n_rows_q, max(n_rows_k, max(n_rows_v, max(n_rows_o, max(n_rows_gate_up, n_rows_down)))));
+    int gemv_blocks = (max_gemv_rows + 255) / 256;
+
+    cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+
+    // ① RMSNorm pre-attention: x_norm = rmsnorm(x, attn_norm)
+    kernel_rmsnorm<<<1, 256, sm_rms, stream>>>(d_x_norm, d_x, d_attn_norm, rms_eps, embed_dim);
+
+    // ② QKV GEMVs from x_norm
+    kernel_gemv_q4k<<<gemv_blocks, 256, 0, stream>>>(d_w_q, d_x_norm, d_q_out, n_rows_q, n_blocks_qkv_o_gate_up, 0.0f, 0.0f);
+    kernel_gemv_q4k<<<gemv_blocks, 256, 0, stream>>>(d_w_k, d_x_norm, d_k_out, n_rows_k, n_blocks_qkv_o_gate_up, 0.0f, 0.0f);
+    kernel_gemv_q4k<<<gemv_blocks, 256, 0, stream>>>(d_w_v, d_x_norm, d_v_out, n_rows_v, n_blocks_qkv_o_gate_up, 0.0f, 0.0f);
+
+    // ③ RoPE in-place on q, k (pos = *d_seq_len - 1)
+    int n_rope_heads = n_heads + n_kv_heads;
+    int attn_blocks = (n_rope_heads + 255) / 256;
+    kernel_rope<<<attn_blocks, 128, 0, stream>>>(d_q_out, d_k_out, n_heads, n_kv_heads, head_dim, d_seq_len);
+
+    // ④ KV save (wpos = *d_wpos, updated before each replay)
+    kernel_kv_save<<<n_kv_heads, head_dim, 0, stream>>>(d_k_out, d_v_out, d_k_buf, d_v_buf, n_kv_heads, head_dim, window_size, d_wpos);
+
+    // ⑤ Attention: scores + softmax*V → attn_out
+    float scale = 1.0f / sqrtf((float)head_dim);
+    dim3 grid_attn(n_heads, window_size);
+    int sm_softmax = window_size * sizeof(float);
+    kernel_scores_dptr<<<grid_attn, 128, 0, stream>>>(
+        d_q_out, d_k_buf, d_scores,
+        n_heads, n_kv_heads, head_dim, window_size, scale, d_seq_len
+    );
+    kernel_softmax_v_dptr<<<n_heads, head_dim, sm_softmax, stream>>>(
+        d_scores, d_v_buf, d_attn_out,
+        n_heads, n_kv_heads, head_dim, window_size, d_seq_len
+    );
+
+    // ⑥ Output GEMV from attn_out → o_out
+    kernel_gemv_q4k<<<gemv_blocks, 256, 0, stream>>>(d_w_o, d_attn_out, d_o_out, n_rows_o, n_blocks_qkv_o_gate_up, 0.0f, 0.0f);
+
+    // ⑦ x += o_out (residual)
+    kernel_add<<<embed_blocks, 256, 0, stream>>>(d_x, d_o_out, embed_dim);
+
+    // ⑧ RMSNorm pre-FFN: x_norm = rmsnorm(x, ffn_norm)
+    kernel_rmsnorm<<<1, 256, sm_rms, stream>>>(d_x_norm, d_x, d_ffn_norm, rms_eps, embed_dim);
+
+    // ⑨ Gate + Up GEMVs from x_norm
+    kernel_gemv_q4k<<<gemv_blocks, 256, 0, stream>>>(d_w_gate, d_x_norm, d_gate_out, n_rows_gate_up, n_blocks_qkv_o_gate_up, 0.0f, 0.0f);
+    kernel_gemv_q4k<<<gemv_blocks, 256, 0, stream>>>(d_w_up, d_x_norm, d_up_out, n_rows_gate_up, n_blocks_qkv_o_gate_up, 0.0f, 0.0f);
+
+    // ⑩ SiLU + Mul in-place on gate
+    kernel_silu_mul<<<ffn_blocks_total, 256, 0, stream>>>(d_gate_out, d_up_out, ffn_dim);
+
+    // ⑪ Down GEMV from gate → down_out
+    kernel_gemv_q4k<<<gemv_blocks, 256, 0, stream>>>(d_w_down, d_gate_out, d_down_out, n_rows_down, n_blocks_down, 0.0f, 0.0f);
+
+    // ⑫ x += down_out (residual)
+    kernel_add<<<embed_blocks, 256, 0, stream>>>(d_x, d_down_out, embed_dim);
+
+    cudaError_t err = cudaStreamEndCapture(stream, &graph);
+    if (err != cudaSuccess) {
+        cudaStreamDestroy(stream);
+        return NULL;
+    }
+
+    // Find kernel nodes for wpos and seq_len to update params
+    cudaGraphExec_t exec;
+    err = cudaGraphInstantiate(&exec, graph, NULL, NULL, 0);
+    if (err != cudaSuccess) {
+        cudaGraphDestroy(graph);
+        cudaStreamDestroy(stream);
+        return NULL;
+    }
+
+    // Store graph + device pointers in a handle
+    LayerGraph* h = new LayerGraph();
+    h->exec = exec;
+    h->d_wpos = d_wpos;
+    h->d_seq_len = d_seq_len;
+    h->d_scores = d_scores;
+
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(stream);
+    return (void*)h;
+}
+
+// Replay the fused layer graph.
+// Before launch: updates d_wpos and d_seq_len on device.
+int gpu_graph_replay_layer(void* handle, cudaStream_t stream, int pos, int window_size) {
+    LayerGraph* h = (LayerGraph*)handle;
+    int wpos = pos % window_size;
+    int seq_len = pos + 1;
+    cudaMemcpyAsync(h->d_wpos, &wpos, sizeof(int), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(h->d_seq_len, &seq_len, sizeof(int), cudaMemcpyHostToDevice, stream);
+    cudaError_t err = cudaGraphLaunch(h->exec, stream);
+    if (err != cudaSuccess) return -1;
+    return 0;
+}
+
+void gpu_graph_destroy_layer(void* handle) {
+    if (!handle) return;
+    LayerGraph* h = (LayerGraph*)handle;
+    cudaGraphExecDestroy(h->exec);
+    delete h;
 }
 
 } // extern "C"

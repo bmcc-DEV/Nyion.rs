@@ -1,0 +1,217 @@
+{
+  "main": {
+    "id": "55185fd31c50bd8c",
+    "type": "split",
+    "children": [
+      {
+        "id": "d602a9327e6d37c4",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "2c414487b4f0cce9",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "hyperstream/sprint2-shard-io.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "sprint2-shard-io"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "530a6c8ec6a1a353",
+    "type": "split",
+    "children": [
+      {
+        "id": "1fec5a2230fdd29b",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "d44d9812c68f83fe",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false
+              },
+              "icon": "lucide-folder-closed",
+              "title": "Explorador de arquivos"
+            }
+          },
+          {
+            "id": "33d8c43fe40d91ff",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "Procurar"
+            }
+          },
+          {
+            "id": "4ea8b31b06d6c80c",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "Marcadores"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "b5a6f6f379edd53f",
+    "type": "split",
+    "children": [
+      {
+        "id": "79f7f7d1e8124940",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "baf427a5de381a19",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "hyperstream/sprint2-shard-io.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "Links inversos para sprint2-shard-io"
+            }
+          },
+          {
+            "id": "17957921ee17c0c5",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "hyperstream/sprint2-shard-io.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "Links de saída para sprint2-shard-io"
+            }
+          },
+          {
+            "id": "8a56f04f6f2a839f",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "Etiquetas"
+            }
+          },
+          {
+            "id": "ce22abfd672533da",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "Todas as propriedades"
+            }
+          },
+          {
+            "id": "846ce35977bb8cd6",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "hyperstream/sprint2-shard-io.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "Sumário de sprint2-shard-io"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:Abrir a troca rápida": false,
+      "graph:Abrir visualização em gráfico": false,
+      "canvas:Criar novo canvas": false,
+      "daily-notes:Abrir a nota de hoje": false,
+      "templates:Inserir modelo": false,
+      "command-palette:Abrir paleta de comandos": false,
+      "bases:Criar nova base": false
+    }
+  },
+  "active": "2c414487b4f0cce9",
+  "lastOpenFiles": [
+    "hyperstream/legacy/VNPU_CONCEPT.md",
+    "hyperstream/legacy/TECHNICAL.md",
+    "hyperstream/legacy/RUNNER_1B_PLAN.md",
+    "hyperstream/legacy/MINDMAP.md",
+    "hyperstream/legacy/FORMULAS.md",
+    "hyperstream/legacy",
+    "hyperstream/sprint1-vulkan-transfer.md",
+    "hyperstream/sprint0-research.md",
+    "hyperstream/shard-format-spec.md",
+    "hyperstream/runbook.md",
+    "hyperstream/integration-plan.md",
+    "hyperstream/README.md",
+    "hyperstream/architecture.md",
+    "hyperstream/sprint3-dspark-scheduling.md",
+    "Decisions/ShardFormat.md",
+    "hyperstream/tasks-backlog.md",
+    "hyperstream/sprint6-qat-e2e.md",
+    "hyperstream/sprint5-aimd-governor.md",
+    "hyperstream/sprint4-fallback-cpu.md",
+    "hyperstream/sprint2-shard-io.md",
+    "hyperstream",
+    "Decisions/LanguageBindings.md",
+    "Decisions/Index.md",
+    "Sprints/Sprint-6.md",
+    "Sprints/Sprint-5.md",
+    "Sprints/Sprint-4.md",
+    "Sprints/Sprint-3.md",
+    "Sprints/Sprint-2.md"
+  ]
+}

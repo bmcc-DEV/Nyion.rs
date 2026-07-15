@@ -1,4 +1,4 @@
-# Virtualização de Clock, Threads, Cache e NPU no LLLamañón.rs / SwampLLM
+# Virtualização de Clock, Threads, Cache e NPU no LLLamañón.rs / NyionLLM
 
 **Status:** parcialmente implementado. Este documento junta a estratégia discutida com o estado real do código em `swamp-engine/` — o que já existe, o que foi corrigido, e o que ainda é conceito.
 
@@ -39,7 +39,7 @@ A ideia original: tratar workers de CPU (AVX2/AVX-512), streams CUDA e filas de 
 Hierarquia de três níveis: VRAM (quente) / RAM (morna, paginada) / NVMe (fria). Contexto longo em GPU de 4GB é fisicamente impossível sem isso.
 
 **Implementado:**
-- `PagedKVCache`: paginação real com LRU intrusivo (prev/next por página), eviction pra arquivo cold (`/tmp/swamp_cache`), reload sob demanda. Testes cobrindo eviction e reload.
+- `PagedKVCache`: paginação real com LRU intrusivo (prev/next por página), eviction pra arquivo cold (`/tmp/nyion_cache`), reload sob demanda. Testes cobrindo eviction e reload.
 - `PrefetchEngine`: `mmap` + `madvise(MADV_WILLNEED)` pros **pesos do modelo** (não o KV cache) — streaming de pesos do NVMe sem carregar o `.gguf` inteiro, na linha do "LLM in a Flash".
 
 **Bug encontrado e corrigido:** o pre-heat de páginas frias (`ensure_pages_hot`) rodava incondicionalmente antes de saber se o caminho GPU ia ter sucesso. Quando a GPU está ativa (lendo do seu próprio buffer residente `d_k_buf`/`d_v_buf`, não do `PagedKVCache`), esse pre-heat forçava recarregar todo o histórico frio de volta pra RAM a cada token — derrotando o próprio propósito do eviction exatamente no cenário em que mais importa (GPU ativa + contexto longo). Corrigido: o pre-heat só roda no fallback CPU.

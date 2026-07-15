@@ -28,8 +28,8 @@ use metrics::ConcurrencyMetrics;
 use scheduler::{PriorityQueueScheduler, QueuedRequest};
 
 #[derive(Parser)]
-#[command(name = "swamp-server")]
-#[command(about = "Swamp - Servidor HTTP de Inferencia")]
+#[command(name = "nyion-server")]
+#[command(about = "Nyion - Servidor HTTP de Inferencia")]
 struct Args {
     /// Caminho do modelo GGUF
     #[arg(short, long, default_value = "/media/bruno/3e94d163-2a59-473e-bcc5-09148350a987/MODELS/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf")]
