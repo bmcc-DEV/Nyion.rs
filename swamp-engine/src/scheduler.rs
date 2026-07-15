@@ -377,24 +377,6 @@ impl PerLayerGpuState {
         })
     }
 
-    /// Upload all weight tensors from model RingView data.
-    /// Call after new() and before any GEMV operations.
-    pub fn upload_all_weights(&mut self, model: &crate::model::Model) -> bool {
-        let ctx = match self.ctx.as_mut() { Some(c) => c, None => return false };
-        for l in 0..self.num_layers.min(model.layer_rings.len()) {
-            let r = &model.layer_rings[l];
-            let ok = ctx.upload_layer_weights(
-                l,
-                r.q_slice(), r.k_slice(), r.v_slice(),
-                r.o_slice(), r.gate_slice(), r.up_slice(), r.down_slice(),
-                &[], &[],
-            );
-            if !ok { return false; }
-            if l < self.layer_loaded.len() { self.layer_loaded[l] = true; }
-        }
-        true
-    }
-
     /// Carrega pesos de uma unica layer no GPU sob demanda.
     /// Usa HyperStreamEngine (shard) se disponivel, ou RingView do model como fallback.
     /// Retorna true se layer pronta (ja carregada ou acabou de carregar).
